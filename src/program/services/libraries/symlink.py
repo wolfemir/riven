@@ -218,117 +218,187 @@ def find_broken_symlinks(directory: str) -> list[tuple[str, str]]:
     return broken_symlinks
 
 def fix_broken_symlinks(library_path, rclone_path, max_workers=4):
-    """Find and fix all broken symlinks in the library path using files from the rclone path."""
-    missing_files = 0
+    """Find and fix all broken symlinks in the library path using files from the rclone path.
+    
+    Args:
+        library_path: Path to the library directory containing symlinks
+        rclone_path: Path to the rclone mount containing actual files
+        max_workers: Maximum number of concurrent workers for processing
+        
+    Returns:
+        tuple: (fixed_count, missing_count, error_count)
+    """
+    stats = {
+        'fixed': 0,
+        'missing': 0,
+        'errors': 0,
+        'total': 0,
+        'start_time': time.time()
+    }
 
-    def check_and_fix_symlink(symlink_path, file_map):
-        """Check and fix a single symlink."""
-        nonlocal missing_files
-
+    def check_and_fix_symlink(symlink_path, file_map, refresh_map_func):
+        """Check and fix a single symlink.
+        
+        Args:
+            symlink_path: Path to the symlink to check
+            file_map: Current mapping of filenames to paths
+            refresh_map_func: Function to refresh the file map
+            
+        Returns:
+            str: Status of the operation ('fixed', 'missing', or 'error')
+        """
         if isinstance(symlink_path, tuple):
             symlink_path = symlink_path[0]
 
-        target_path = os.readlink(symlink_path)
-        filename = os.path.basename(target_path)
-        dirname = os.path.dirname(target_path).split("/")[-1]
-        
-        # Retry timings: 5s, 10s, 20s, 40s, 80s, 5min, 10min, 20min
-        retry_times = [5, 10, 20, 40, 80, 300, 600, 1200]
-        attempt = 0
-        
-        while attempt < len(retry_times):
-            correct_path = file_map.get(filename)
-            if correct_path:
-                break
-                
-            wait_time = retry_times[attempt]
-            attempts_left = len(retry_times) - attempt - 1
+        try:
+            target_path = os.readlink(symlink_path)
+            filename = os.path.basename(target_path)
+            dirname = os.path.dirname(target_path).split("/")[-1]
             
-            if attempts_left > 0:
-                logger.debug(f"File {filename} not found in rclone_path, waiting {wait_time} seconds. {attempts_left} attempts left.")
-                time.sleep(wait_time)
-                file_map = build_file_map(rclone_path)  # Refresh the file map
-            attempt += 1
+            # Progressive retry timings with exponential backoff
+            retry_times = [5, 10, 20, 40, 80, 300, 600, 1200]
+            attempt = 0
+            
+            while attempt < len(retry_times):
+                correct_path = file_map.get(filename)
+                if correct_path:
+                    break
+                    
+                wait_time = retry_times[attempt]
+                attempts_left = len(retry_times) - attempt - 1
+                
+                if attempts_left > 0:
+                    logger.debug(f"File {filename} not found, attempt {attempt + 1}/{len(retry_times)}, waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    file_map.update(refresh_map_func())  # Update only if needed
+                attempt += 1
 
-        failed = False
+            with db.Session() as session:
+                items = get_items_from_filepath(session, symlink_path)
+                if not items:
+                    logger.warning(f"No database items found for path: {symlink_path}")
+                    return 'error'
 
-        with db.Session() as session:
-            items = get_items_from_filepath(session, symlink_path)
-            if not items:
-                logger.log("NOT_FOUND", f"Could not find item in database for path: {symlink_path}")
-                return
-
-            if correct_path:
-                os.remove(symlink_path)
-                os.symlink(correct_path, symlink_path)
-                try:
+                if correct_path:
+                    try:
+                        # Remove old symlink and create new one
+                        os.remove(symlink_path)
+                        os.symlink(correct_path, symlink_path)
+                        
+                        # Update database entries
+                        for item in items:
+                            item = session.merge(item)
+                            item.file = filename
+                            item.folder = dirname
+                            item.symlinked = True
+                            item.symlink_path = correct_path
+                            item.update_folder = correct_path
+                            item.store_state()
+                            session.merge(item)
+                        
+                        session.commit()
+                        logger.info(f"Fixed symlink: {symlink_path} -> {correct_path}")
+                        return 'fixed'
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to fix symlink {symlink_path}: {str(e)}")
+                        return 'error'
+                else:
+                    # Handle missing files
+                    os.remove(symlink_path)
                     for item in items:
                         item = session.merge(item)
-                        item.file = filename
-                        item.folder = dirname
-                        item.symlinked = True
-                        item.symlink_path = correct_path
-                        item.update_folder = correct_path
+                        item.reset()
                         item.store_state()
                         session.merge(item)
-                        logger.log("FILES", f"Retargeted broken symlink for {item.log_string} with correct path: {correct_path}")
-                except Exception as e:
-                    logger.error(f"Failed to fix {item.log_string} with path: {correct_path}: {str(e)}")
-                    failed = True
-            else:
-                os.remove(symlink_path)
-                for item in items:
-                    item = session.merge(item)
-                    item.reset()
-                    item.store_state()
-                    session.merge(item)
-                missing_files += 1
-                total_wait = sum(retry_times[:attempt])
-                logger.log("NOT_FOUND", f"Could not find file {filename} in rclone_path after {attempt} attempts and {total_wait} seconds")
+                    
+                    total_wait = sum(retry_times[:attempt])
+                    logger.warning(f"File {filename} not found after {attempt} attempts ({total_wait}s)")
+                    session.commit()
+                    return 'missing'
+                    
+        except Exception as e:
+            logger.error(f"Error processing symlink {symlink_path}: {str(e)}")
+            return 'error'
 
-            session.commit()
-            logger.log("FILES", "Saved items to the database.")
+    def process_directory(directory):
+        """Process all broken symlinks in a directory."""
+        try:
+            local_broken_symlinks = find_broken_symlinks(directory)
+            count = len(local_broken_symlinks)
+            if count == 0:
+                return
+                
+            logger.info(f"Processing {count} broken symlinks in {directory}")
+            stats['total'] += count
+            
+            # Create a local file map for this directory
+            current_map = build_file_map(rclone_path)
+            
+            with ThreadPoolExecutor(thread_name_prefix="FixSymlinks", max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        check_and_fix_symlink, 
+                        symlink_path, 
+                        current_map,
+                        lambda: build_file_map(rclone_path)
+                    ): symlink_path 
+                    for symlink_path in local_broken_symlinks
+                }
+                
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        stats[result] += 1
+                        
+                        # Log progress periodically
+                        if (stats['fixed'] + stats['missing'] + stats['errors']) % 10 == 0:
+                            elapsed = time.time() - stats['start_time']
+                            logger.info(
+                                f"Progress: {stats['fixed']} fixed, {stats['missing']} missing, "
+                                f"{stats['errors']} errors ({elapsed:.1f}s elapsed)"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error in symlink processing: {str(e)}")
+                        stats['errors'] += 1
+                        
+        except Exception as e:
+            logger.error(f"Error processing directory {directory}: {str(e)}")
 
-            if failed:
-                logger.warning("Failed to retarget some broken symlinks, recommended action: reset database.")
+    logger.info(f"Starting symlink repair: {library_path} -> {rclone_path}")
+    
+    # Validate paths
+    if not os.path.exists(rclone_path):
+        logger.error(f"Rclone path does not exist: {rclone_path}")
+        return (0, 0, 0)
+        
+    if not os.path.exists(library_path):
+        logger.error(f"Library path does not exist: {library_path}")
+        return (0, 0, 0)
 
-    def process_directory(directory, file_map):
-        """Process a single directory for broken symlinks."""
-        local_broken_symlinks = find_broken_symlinks(directory)
-        logger.log("FILES", f"Found {len(local_broken_symlinks)} broken symlinks in {directory}")
-        if not local_broken_symlinks:
-            return
+    # Process all directories
+    top_level_dirs = [
+        os.path.join(library_path, d) 
+        for d in os.listdir(library_path) 
+        if os.path.isdir(os.path.join(library_path, d))
+    ]
+    
+    if not top_level_dirs:
+        logger.warning(f"No directories found in {library_path}")
+        return (0, 0, 0)
 
-        with ThreadPoolExecutor(thread_name_prefix="FixSymlinks", max_workers=max_workers) as executor:
-            futures = [executor.submit(check_and_fix_symlink, symlink_path, file_map) for symlink_path in local_broken_symlinks]
-            for future in as_completed(futures):
-                future.result()
-
-    start_time = time.time()
-    logger.log("FILES", f"Finding and fixing broken symlinks in {library_path} using files from {rclone_path}")
-
-    file_map = build_file_map(rclone_path)
-    if not file_map:
-        logger.log("FILES", f"No files found in rclone_path: {rclone_path}. Aborting fix_broken_symlinks.")
-        return
-
-    logger.log("FILES", f"Built file map for {rclone_path}")
-
-    top_level_dirs = [os.path.join(library_path, d) for d in os.listdir(library_path) if os.path.isdir(os.path.join(library_path, d))]
-    logger.log("FILES", f"Found top-level directories: {top_level_dirs}")
-
+    logger.info(f"Found {len(top_level_dirs)} directories to process")
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_directory, directory, file_map) for directory in top_level_dirs]
-        if not futures:
-            logger.log("FILES", f"No directories found in {library_path}. Aborting fix_broken_symlinks.")
-            return
-        for future in as_completed(futures):
-            future.result()
+        list(executor.map(process_directory, top_level_dirs))
 
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    logger.log("FILES", f"Finished processing and retargeting broken symlinks. Time taken: {elapsed_time:.2f} seconds.")
-    logger.log("FILES", f"Reset {missing_files} items to be rescraped due to missing rclone files.")
+    elapsed = time.time() - stats['start_time']
+    logger.info(
+        f"Symlink repair complete in {elapsed:.1f}s: "
+        f"{stats['fixed']} fixed, {stats['missing']} missing, {stats['errors']} errors"
+    )
+    
+    return (stats['fixed'], stats['missing'], stats['errors'])
 
 def get_items_from_filepath(session: Session, filepath: str) -> list["Movie"] | list["Episode"]:
     """Get items that match the imdb_id or season and episode from a file in library_path"""
