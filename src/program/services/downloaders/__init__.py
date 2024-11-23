@@ -14,6 +14,8 @@ from .alldebrid import AllDebridDownloader
 from .realdebrid import RealDebridDownloader, TorrentNotFoundError, InvalidFileIDError
 # from .torbox import TorBoxDownloader
 
+from datetime import datetime
+
 class InvalidFileSizeException(Exception):
     pass
 
@@ -141,6 +143,9 @@ class Downloader:
                 item.folder = filename
                 item.alternative_folder = original_filename
                 item.active_stream = {"infohash": info_hash, "id": id}
+                item.symlinked = True  # Mark as ready for symlinking
+                item.symlinked_at = datetime.now()  # Record when it was marked for symlinking
+                item.store_state()  # Force state update
                 found = True
                 break
             if item.type in (ShowMediaType.Show.value, ShowMediaType.Season.value, ShowMediaType.Episode.value):
@@ -159,6 +164,9 @@ class Downloader:
                             episode.folder = filename
                             episode.alternative_folder = original_filename
                             episode.active_stream = {"infohash": info_hash, "id": id}
+                            episode.symlinked = True  # Mark as ready for symlinking
+                            episode.symlinked_at = datetime.now()  # Record when it was marked for symlinking
+                            episode.store_state()  # Force state update
                             # We have to make sure the episode is correct if item is an episode
                             if item.type != ShowMediaType.Episode.value or (item.type == ShowMediaType.Episode.value and episode.number == item.number):
                                 found = True
