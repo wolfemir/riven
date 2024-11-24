@@ -27,94 +27,105 @@ class EventManager:
     Manages the execution of services and the handling of events.
     """
     def __init__(self):
-        self._executors: list[ThreadPoolExecutor] = []
-        self._futures: list[Future] = []
-        self._queued_events: list[Event] = []
-        self._running_events: list[Event] = []
-        self._canceled_futures: list[Future] = []
+        self._executors: Dict[str, ThreadPoolExecutor] = {}  # Using dict for O(1) lookup
+        self._futures: set[Future] = set()  # Using set for O(1) operations
+        self._queued_events: set[Event] = set()
+        self._running_events: set[Event] = set()
+        self._canceled_futures: set[Future] = set()
         self._content_queue: list[Event] = []
         self.mutex = Lock()
+        self._event_cache = {}  # Cache for event updates
+        self._cache_lock = Lock()
 
     def _find_or_create_executor(self, service_cls) -> ThreadPoolExecutor:
-        """
-        Finds or creates a ThreadPoolExecutor for the given service class.
-
-        Args:
-            service_cls (type): The service class for which to find or create an executor.
-
-        Returns:
-            concurrent.futures.ThreadPoolExecutor: The executor for the service class.
-        """
+        """Find or create a ThreadPoolExecutor for the given service class."""
         service_name = service_cls.__name__
-        env_var_name = f"{service_name.upper()}_MAX_WORKERS"
-        max_workers = int(os.environ.get(env_var_name, 1))
-        for executor in self._executors:
-            if executor["_name_prefix"] == service_name:
-                logger.debug(f"Executor for {service_name} found.")
-                return executor["_executor"]
-        _executor = ThreadPoolExecutor(thread_name_prefix=service_name, max_workers=max_workers)
-        self._executors.append({ "_name_prefix": service_name, "_executor": _executor })
-        logger.debug(f"Created executor for {service_name} with {max_workers} max workers.")
-        return _executor
+        
+        with self.mutex:
+            if service_name in self._executors:
+                return self._executors[service_name]
+            
+            env_var_name = f"{service_name.upper()}_MAX_WORKERS"
+            max_workers = int(os.environ.get(env_var_name, 3))  # Default to 3 workers
+            
+            executor = ThreadPoolExecutor(
+                thread_name_prefix=service_name,
+                max_workers=max_workers
+            )
+            self._executors[service_name] = executor
+            logger.debug(f"Created executor for {service_name} with {max_workers} max workers.")
+            return executor
 
     def _process_future(self, future, service):
-        """
-        Processes the result of a future once it is completed.
-
-        Args:
-            future (concurrent.futures.Future): The future to process.
-            service (type): The service class associated with the future.
-        """
-
+        """Process the result of a future with improved error handling and caching."""
         if future.cancelled():
-            logger.debug(f"Future for {future} was cancelled.")
-            return  # Skip processing if the future was cancelled
+            with self.mutex:
+                self._futures.discard(future)
+            return
 
         try:
             result = future.result()
-            if future in self._futures:
-                self._futures.remove(future)
-            sse_manager.publish_event("event_update", self.get_event_updates())
+            
+            with self.mutex:
+                self._futures.discard(future)
+                if hasattr(future, "event"):
+                    self._running_events.discard(future.event)
+
             if isinstance(result, tuple):
                 item_id, timestamp = result
             else:
                 item_id, timestamp = result, datetime.now()
-            if item_id:
-                self.remove_event_from_running(future.event)
-                logger.debug(f"Removed {future.event.log_message} from running events.")
-                if future.cancellation_event.is_set():
-                    logger.debug(f"Future with Item ID: {item_id} was cancelled discarding results...")
-                    return
-                self.add_event(Event(emitted_by=service, item_id=item_id, run_at=timestamp))
+
+            if item_id and not future.cancellation_event.is_set():
+                new_event = Event(
+                    emitted_by=service,
+                    item_id=item_id,
+                    run_at=timestamp
+                )
+                self.add_event(new_event)
+                
+                # Update cache
+                with self._cache_lock:
+                    self._event_cache[item_id] = {
+                        "item_id": item_id,
+                        "emitted_by": service.__name__,
+                        "run_at": timestamp.isoformat()
+                    }
+                
+            # Batch update SSE events
+            if len(self._event_cache) >= 10:  # Batch size
+                self._publish_event_updates()
+
         except Exception as e:
-            logger.error(f"Error in future for {future}: {e}")
-            logger.exception(traceback.format_exc())
-        log_message = f"Service {service.__name__} executed"
-        if hasattr(future, "event"):
-            log_message += f" with {future.event.log_message}"
-        logger.debug(log_message)
+            logger.error(f"Error in future for {service.__name__}: {str(e)}")
+            if logger.level("DEBUG").no <= logger.level("DEBUG").no:
+                logger.debug(traceback.format_exc())
+
+    def _publish_event_updates(self):
+        """Batch publish event updates to SSE."""
+        with self._cache_lock:
+            if self._event_cache:
+                updates = list(self._event_cache.values())
+                sse_manager.publish_event("event_update", updates)
+                self._event_cache.clear()
 
     def add_event_to_queue(self, event: Event, log_message=True):
-        """
-        Adds an event to the queue.
-
-        Args:
-            event (Event): The event to add to the queue.
-        """
+        """Add an event to the queue with improved efficiency."""
         with self.mutex:
-            self._queued_events.append(event)
-            if log_message:
-                logger.debug(f"Added {event.log_message} to the queue.")
+            if event not in self._queued_events:
+                self._queued_events.add(event)
+                if log_message:
+                    logger.debug(f"Added {event.log_message} to the queue.")
 
     def remove_event_from_queue(self, event: Event):
         with self.mutex:
-            self._queued_events.remove(event)
+            self._queued_events.discard(event)
             logger.debug(f"Removed {event.log_message} from the queue.")
 
     def remove_event_from_running(self, event: Event):
         with self.mutex:
             if event in self._running_events:
-                self._running_events.remove(event)
+                self._running_events.discard(event)
                 logger.debug(f"Removed {event.log_message} from running events.")
 
     def remove_id_from_queue(self, item_id: str):
@@ -124,20 +135,9 @@ class EventManager:
         Args:
             item (MediaItem): The event item to remove from the queue.
         """
-        for event in self._queued_events:
+        for event in list(self._queued_events):
             if event.item_id == item_id:
                 self.remove_event_from_queue(event)
-
-    def add_event_to_running(self, event: Event):
-        """
-        Adds an event to the running events.
-
-        Args:
-            event (Event): The event to add to the running events.
-        """
-        with self.mutex:
-            self._running_events.append(event)
-            logger.debug(f"Added {event.log_message} to running events.")
 
     def remove_id_from_running(self, item_id: str):
         """
@@ -146,7 +146,7 @@ class EventManager:
         Args:
             item (MediaItem): The event item to remove from the running events.
         """
-        for event in self._running_events:
+        for event in list(self._running_events):
             if event.item_id == item_id:
                 self.remove_event_from_running(event)
 
@@ -182,7 +182,8 @@ class EventManager:
         future.cancellation_event = cancellation_event
         if event:
             future.event = event
-        self._futures.append(future)
+        with self.mutex:
+            self._futures.add(future)
         sse_manager.publish_event("event_update", self.get_event_updates())
         future.add_done_callback(lambda f:self._process_future(f, service))
 
@@ -198,7 +199,7 @@ class EventManager:
             item_id, related_ids = db_functions.get_item_ids(session, item_id)
             ids_to_cancel = set([item_id] + related_ids)
 
-            for future in self._futures:
+            for future in list(self._futures):
                 future_item_id = None
                 future_related_ids = []
 
@@ -212,7 +213,8 @@ class EventManager:
                         try:
                             future.cancellation_event.set()
                             future.cancel()
-                            self._canceled_futures.append(future)
+                            with self.mutex:
+                                self._canceled_futures.add(future)
                         except Exception as e:
                             if not suppress_logs:
                                 logger.error(f"Error cancelling future for {future_item.log_string}: {str(e)}")
@@ -233,9 +235,11 @@ class EventManager:
         while True:
             if self._queued_events:
                 with self.mutex:
-                    self._queued_events.sort(key=lambda event: event.run_at)
-                    if datetime.now() >= self._queued_events[0].run_at:
-                        event = self._queued_events.pop(0)
+                    events = list(self._queued_events)
+                    events.sort(key=lambda event: event.run_at)
+                    if datetime.now() >= events[0].run_at:
+                        event = events.pop(0)
+                        self._queued_events.discard(event)
                         return event
             raise Empty
 
@@ -312,7 +316,6 @@ class EventManager:
         if not db_functions.get_item_by_external_id(imdb_id=item.imdb_id):
             if self.add_event(Event(service, content_item=item)):
                 logger.debug(f"Added item with IMDB ID {item.imdb_id} to the queue.")
-
 
     def get_event_updates(self) -> Dict[str, List[str]]:
         events = [future.event for future in self._futures if hasattr(future, "event")]
