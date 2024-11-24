@@ -401,12 +401,28 @@ class RealDebridDownloader(DownloaderBase):
                 del self.active_downloads[content_id]
 
     def _mark_content_complete(self, content_id: str):
-        """Mark a content as having completed download."""
+        """Mark content as having a successful download."""
         self.download_complete[content_id] = True
 
     def _is_content_complete(self, content_id: str) -> bool:
-        """Check if content has completed download."""
-        return content_id in self.download_complete and self.download_complete[content_id]
+        """Check if content has a successful download."""
+        if content_id in self.download_complete:
+            return True
+
+        # Also check if the content exists in the mount
+        try:
+            # Get torrent info from active downloads
+            if content_id in self.active_downloads:
+                torrent_ids = self.active_downloads[content_id]
+                for torrent_id in torrent_ids:
+                    info = self.get_torrent_info(torrent_id)
+                    if info and info.get("status") == "downloaded":
+                        self._mark_content_complete(content_id)
+                        return True
+        except Exception as e:
+            logger.error(f"Error checking download status: {e}")
+            
+        return False
 
     def download_cached_stream(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
         """Download a stream from Real-Debrid"""
