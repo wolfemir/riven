@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Generator, Optional, Union
+from enum import Enum
+from typing import Generator, Optional, Union, TYPE_CHECKING
 
 from program.media.item import MediaItem
 from program.services.content import (
@@ -11,7 +12,6 @@ from program.services.content import (
     TraktContent,
 )
 from program.services.downloaders import AllDebridDownloader, RealDebridDownloader
-
 # TorBoxDownloader,
 from program.services.libraries import SymlinkLibrary
 from program.services.scrapers import (
@@ -26,16 +26,26 @@ from program.services.scrapers import (
     Zilean,
 )
 from program.services.updaters import Updater
-from program.symlink import Symlinker
+
+if TYPE_CHECKING:
+    from program.symlink import Symlinker
 
 # Typehint classes
 Scraper = Union[Scraping, Torrentio, Knightcrawler, Mediafusion, Orionoid, Jackett, TorBoxScraper, Zilean, Comet]
 Content = Union[Overseerr, PlexWatchlist, Listrr, Mdblist, TraktContent]
-Downloader = Union[RealDebridDownloader,
-                #    TorBoxDownloader,
-                AllDebridDownloader]
-Service = Union[Content, SymlinkLibrary, Scraper, Downloader, Symlinker, Updater]
+Downloader = Union[RealDebridDownloader, AllDebridDownloader]  # TorBoxDownloader
+if TYPE_CHECKING:
+    Service = Union[Content, SymlinkLibrary, Scraper, Downloader, "Symlinker", Updater]
+else:
+    Service = Union[Content, SymlinkLibrary, Scraper, Downloader, Updater]
 MediaItemGenerator = Generator[MediaItem, None, MediaItem | None]
+
+class EventType(Enum):
+    SYMLINK = "symlink"
+    CONTENT = "content"
+    DOWNLOAD = "download"
+    SCRAPE = "scrape"
+    UPDATE = "update"
 
 class ProcessedEvent:
     service: Service
