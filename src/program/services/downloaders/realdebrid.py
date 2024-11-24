@@ -100,7 +100,7 @@ class RealDebridDownloader(DownloaderBase):
     """Main Real-Debrid downloader class implementing DownloaderBase"""
     MAX_RETRIES = 3
     RETRY_DELAY = 1.0
-    DOWNLOAD_POLL_INTERVAL = 5  # seconds
+    DOWNLOAD_POLL_INTERVAL = 1.0  # Reduced from default
     DOWNLOAD_TIMEOUT = 300  # 5 minutes
     MAX_QUEUE_ATTEMPTS = 6  # Maximum number of queued torrents before retrying item later
     
@@ -114,8 +114,9 @@ class RealDebridDownloader(DownloaderBase):
         self.active_downloads = defaultdict(set)  # {content_id: set(torrent_ids)}
         self.download_complete = {}  # Track if a content's download is complete
         self.queue_attempts = defaultdict(int)  # Track number of queued attempts per content
-        self.MAX_CONCURRENT_TOTAL = 10
-        self.MAX_CONCURRENT_PER_CONTENT = 3
+        self.MAX_CONCURRENT_TOTAL = 20  # Increased from 10
+        self.MAX_CONCURRENT_PER_CONTENT = 5  # Increased from 3
+        self.download_cache = {}  # Cache for download results
 
     def validate(self) -> bool:
         """

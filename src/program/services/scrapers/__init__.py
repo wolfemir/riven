@@ -1,6 +1,7 @@
 import threading
 from datetime import datetime
 from typing import Dict, Generator, List
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from loguru import logger
 
@@ -73,40 +74,43 @@ class Scraping:
 
     def scrape(self, item: MediaItem, log = True) -> Dict[str, Stream]:
         """Scrape an item."""
-        threads: List[threading.Thread] = []
         results: Dict[str, str] = {}
         total_results = 0
         results_lock = threading.RLock()
+        thread_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="Scraper")
 
         imdb_id = item.get_top_imdb_id()
         available_services = self.services if imdb_id else self.keyword_services
 
         def run_service(service, item,):
             nonlocal total_results
-            service_results = service.run(item)
+            try:
+                service_results = service.run(item)
 
-            if not isinstance(service_results, dict):
-                logger.error(f"Service {service.__class__.__name__} returned invalid results: {service_results}")
-                return
+                if not isinstance(service_results, dict):
+                    logger.error(f"Service {service.__class__.__name__} returned invalid results: {service_results}")
+                    return
 
-            # ensure that info hash is lower case in each result
-            if isinstance(service_results, dict):
-                for infohash in list(service_results.keys()):
-                    if infohash.lower() != infohash:
-                        service_results[infohash.lower()] = service_results.pop(infohash)
+                # ensure that info hash is lower case in each result
+                if isinstance(service_results, dict):
+                    for infohash in list(service_results.keys()):
+                        if infohash.lower() != infohash:
+                            service_results[infohash.lower()] = service_results.pop(infohash)
 
-            with results_lock:
-                results.update(service_results)
-                total_results += len(service_results)
+                with results_lock:
+                    results.update(service_results)
+                    total_results += len(service_results)
+            except Exception as e:
+                logger.error(f"Error in scraper {service.__class__.__name__}: {str(e)}")
 
+        futures = []
         for service_name, service in available_services.items():
             if service.initialized:
-                thread = threading.Thread(target=run_service, args=(service, item), name=service_name.__name__)
-                threads.append(thread)
-                thread.start()
+                futures.append(thread_pool.submit(run_service, service, item))
 
-        for thread in threads:
-            thread.join()
+        # Wait for all futures to complete
+        wait(futures)
+        thread_pool.shutdown(wait=True)
 
         if total_results != len(results):
             logger.debug(f"Scraped {item.log_string} with {total_results} results, removed {total_results - len(results)} duplicate hashes")
