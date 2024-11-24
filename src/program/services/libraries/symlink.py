@@ -3,7 +3,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Generator, Dict
 from sqlalchemy.orm import aliased
 
 from loguru import logger
@@ -190,32 +190,190 @@ def process_shows(directory: Path, item_type: str, is_anime: bool = False) -> Ge
         yield show_item
 
 
-def build_file_map(directory: str) -> dict[str, str]:
-    """Build a map of filenames to their full paths in the directory."""
+def build_file_map(rclone_path: str, use_cache: bool = True) -> Dict[str, str]:
+    """Build a map of filenames to their full paths.
+    
+    Args:
+        rclone_path: Base path to scan for files
+        use_cache: Whether to use cached results if available
+    """
+    cache_key = f"file_map_{rclone_path}"
+    cache_timeout = 300  # 5 minutes
+    
+    if use_cache:
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+    
     file_map = {}
+    try:
+        for root, _, files in os.walk(rclone_path):
+            for filename in files:
+                if os.path.splitext(filename)[1][1:] in ALLOWED_VIDEO_EXTENSIONS:
+                    full_path = os.path.join(root, filename)
+                    # Store both original filename and normalized version
+                    file_map[filename] = full_path
+                    file_map[normalize_filename(filename)] = full_path
+        
+        cache.set(cache_key, file_map, timeout=cache_timeout)
+        return file_map
+        
+    except Exception as e:
+        logger.error(f"Error building file map for {rclone_path}: {e}")
+        return {}
 
-    def scan_dir(path):
-        with os.scandir(path) as entries:
-            for entry in entries:
-                if entry.is_file():
-                    file_map[entry.name] = entry.path
-                elif entry.is_dir():
-                    scan_dir(entry.path)
+def normalize_filename(filename: str) -> str:
+    """Normalize filename for better matching."""
+    # Remove common release group tags
+    clean = re.sub(r"-[A-Za-z0-9]+$", "", filename)
+    # Remove quality tags
+    clean = re.sub(r"\b(720p|1080p|2160p|BluRay|WEB-DL|WEBRip|HDRip|BRRip)\b", "", clean)
+    # Remove spaces and convert to lowercase
+    clean = clean.lower().replace(" ", "")
+    return clean
 
-    scan_dir(directory)
-    return file_map
+def check_and_fix_symlink(symlink_path, file_map):
+    """Check and fix a single symlink with atomic operations and caching."""
+    nonlocal missing_files
 
-def find_broken_symlinks(directory: str) -> list[tuple[str, str]]:
-    """Find all broken symlinks in the directory."""
-    broken_symlinks = []
-    for root, dirs, files in os.walk(directory):
-        for name in files + dirs:
-            full_path = os.path.join(root, name)
-            if os.path.islink(full_path):
-                target = os.readlink(full_path)
-                if not os.path.exists(os.path.realpath(full_path)):
-                    broken_symlinks.append((full_path, target))
-    return broken_symlinks
+    if isinstance(symlink_path, tuple):
+        symlink_path = symlink_path[0]
+
+    try:
+        target_path = os.readlink(symlink_path)
+        filename = os.path.basename(target_path)
+        dirname = os.path.dirname(target_path).split("/")[-1]
+        
+        # Try both exact and normalized filename matches
+        correct_path = file_map.get(filename) or file_map.get(normalize_filename(filename))
+        
+        if correct_path and os.path.exists(correct_path):
+            return _fix_symlink(symlink_path, correct_path, filename, dirname)
+            
+        # Progressive retry with longer delays
+        delays = [5, 15, 30, 60, 120]  # 5s, 15s, 30s, 1min, 2min
+        attempt = 0
+        
+        while attempt < len(delays):
+            delay = delays[attempt]
+            attempts_left = len(delays) - attempt - 1
+            
+            logger.debug(f"File {filename} not found in rclone_path, waiting {delay} seconds. {attempts_left} attempts left.")
+            time.sleep(delay)
+            
+            # Force refresh file map on retries
+            file_map = build_file_map(rclone_path, use_cache=False)
+            correct_path = file_map.get(filename) or file_map.get(normalize_filename(filename))
+            
+            if correct_path and os.path.exists(correct_path):
+                return _fix_symlink(symlink_path, correct_path, filename, dirname)
+                
+            attempt += 1
+
+        # Handle permanent failure
+        logger.log("NOT_FOUND", f"Could not find file {filename} in rclone_path after {len(delays)} attempts")
+        return _handle_missing_file(symlink_path, filename)
+
+    except Exception as e:
+        logger.error(f"Error checking/fixing symlink {symlink_path}: {e}")
+        return False
+
+def _handle_missing_file(symlink_path: str, filename: str) -> bool:
+    """Handle permanently missing files by cleaning up and updating database."""
+    try:
+        # Atomic removal of symlink
+        if os.path.exists(symlink_path) or os.path.islink(symlink_path):
+            os.remove(symlink_path)
+            
+        with db.Session() as session:
+            items = get_items_from_filepath(session, symlink_path)
+            if not items:
+                return False
+                
+            for item in items:
+                item = session.merge(item)
+                # Reset item state
+                item.reset()
+                item.store_state()
+                # Queue for re-scraping
+                event = Event(
+                    event_type=EventType.SCRAPE,
+                    media_item_id=item.id,
+                    priority=2  # Higher priority for missing files
+                )
+                session.add(event)
+                session.merge(item)
+                
+            missing_files += 1
+            session.commit()
+            logger.info(f"Queued missing file {filename} for re-scraping")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error handling missing file {symlink_path}: {e}")
+        return False
+
+def _fix_symlink(symlink_path: str, correct_path: str, filename: str, dirname: str) -> bool:
+    """Fix a symlink with atomic operations and proper error handling."""
+    temp_link = f"{symlink_path}.tmp"
+    
+    try:
+        with db.Session() as session:
+            items = get_items_from_filepath(session, symlink_path)
+            if not items:
+                logger.log("NOT_FOUND", f"Could not find item in database for path: {symlink_path}")
+                return False
+
+            # Create temporary symlink first
+            if os.path.exists(temp_link) or os.path.islink(temp_link):
+                os.remove(temp_link)
+            os.symlink(correct_path, temp_link)
+            
+            # Verify temporary symlink
+            if not os.path.exists(os.path.realpath(temp_link)):
+                logger.error(f"Failed to create temporary symlink at {temp_link}")
+                return False
+
+            # Remove old symlink if it exists
+            if os.path.exists(symlink_path) or os.path.islink(symlink_path):
+                os.remove(symlink_path)
+
+            # Atomic rename of temporary to final symlink
+            os.rename(temp_link, symlink_path)
+
+            # Update database entries
+            for item in items:
+                item = session.merge(item)
+                item.file = filename
+                item.folder = dirname
+                item.symlinked = True
+                item.symlink_path = correct_path
+                item.update_folder = correct_path
+                item.store_state()
+                session.merge(item)
+                logger.log("FILES", f"Fixed symlink for {item.log_string} with path: {correct_path}")
+
+            session.commit()
+            return True
+
+    except OSError as e:
+        logger.error(f"OS error fixing symlink {symlink_path}: {e}")
+        _cleanup_temp_files(temp_link, symlink_path)
+        return False
+
+    except Exception as e:
+        logger.error(f"Error fixing symlink {symlink_path}: {e}")
+        _cleanup_temp_files(temp_link, symlink_path)
+        return False
+
+def _cleanup_temp_files(*paths: str) -> None:
+    """Clean up temporary files and symlinks."""
+    for path in paths:
+        if os.path.exists(path) or os.path.islink(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                logger.error(f"Error cleaning up {path}: {e}")
 
 def fix_broken_symlinks(library_path, rclone_path, max_workers=4):
     """Find and fix all broken symlinks in the library path using files from the rclone path."""
@@ -228,68 +386,60 @@ def fix_broken_symlinks(library_path, rclone_path, max_workers=4):
         if isinstance(symlink_path, tuple):
             symlink_path = symlink_path[0]
 
-        target_path = os.readlink(symlink_path)
-        filename = os.path.basename(target_path)
-        dirname = os.path.dirname(target_path).split("/")[-1]
-        
-        delays = settings_manager.settings.symlink.retry_delays
-        attempt = 0
-        
-        while attempt < len(delays):
-            correct_path = file_map.get(filename)
-            if correct_path:
-                break
-                
-            delay = delays[attempt]
-            attempts_left = len(delays) - attempt - 1
+        try:
+            target_path = os.readlink(symlink_path)
+            filename = os.path.basename(target_path)
+            dirname = os.path.dirname(target_path).split("/")[-1]
             
-            if attempts_left > 0:
+            # First check if file exists in current file_map
+            correct_path = file_map.get(filename)
+            if correct_path and os.path.exists(correct_path):
+                # File found immediately, proceed with fix
+                return _fix_symlink(symlink_path, correct_path, filename, dirname)
+                
+            # Progressive retry with longer delays
+            delays = [5, 15, 30, 60, 120]  # 5s, 15s, 30s, 1min, 2min
+            attempt = 0
+            
+            while attempt < len(delays):
+                delay = delays[attempt]
+                attempts_left = len(delays) - attempt - 1
+                
                 logger.debug(f"File {filename} not found in rclone_path, waiting {delay} seconds. {attempts_left} attempts left.")
                 time.sleep(delay)
-                file_map = build_file_map(rclone_path)  # Refresh the file map
-            attempt += 1
+                
+                # Refresh file map and check again
+                file_map = build_file_map(rclone_path)
+                correct_path = file_map.get(filename)
+                
+                if correct_path and os.path.exists(correct_path):
+                    return _fix_symlink(symlink_path, correct_path, filename, dirname)
+                    
+                attempt += 1
 
-        failed = False
-
-        with db.Session() as session:
-            items = get_items_from_filepath(session, symlink_path)
-            if not items:
-                logger.log("NOT_FOUND", f"Could not find item in database for path: {symlink_path}")
-                return
-
-            if correct_path:
+            # If we reach here, file was not found after all retries
+            logger.log("NOT_FOUND", f"Could not find file {filename} in rclone_path after {len(delays)} attempts")
+            
+            # Clean up broken symlink and update database
+            if os.path.exists(symlink_path) or os.path.islink(symlink_path):
                 os.remove(symlink_path)
-                os.symlink(correct_path, symlink_path)
-                try:
+                
+            with db.Session() as session:
+                items = get_items_from_filepath(session, symlink_path)
+                if items:
                     for item in items:
                         item = session.merge(item)
-                        item.file = filename
-                        item.folder = dirname
-                        item.symlinked = True
-                        item.symlink_path = correct_path
-                        item.update_folder = correct_path
+                        item.reset()
                         item.store_state()
                         session.merge(item)
-                        logger.log("FILES", f"Retargeted broken symlink for {item.log_string} with correct path: {correct_path}")
-                except Exception as e:
-                    logger.error(f"Failed to fix {item.log_string} with path: {correct_path}: {str(e)}")
-                    failed = True
-            else:
-                os.remove(symlink_path)
-                for item in items:
-                    item = session.merge(item)
-                    item.reset()
-                    item.store_state()
-                    session.merge(item)
-                missing_files += 1
-                total_wait = sum(delays[:attempt])
-                logger.log("NOT_FOUND", f"Could not find file {filename} in rclone_path after {attempt} attempts and {total_wait} seconds")
+                    missing_files += 1
+                    session.commit()
+                    
+            return False
 
-            session.commit()
-            logger.log("FILES", "Saved items to the database.")
-
-            if failed:
-                logger.warning("Failed to retarget some broken symlinks, recommended action: reset database.")
+        except Exception as e:
+            logger.error(f"Error checking/fixing symlink {symlink_path}: {e}")
+            return False
 
     def process_directory(directory, file_map):
         """Process a single directory for broken symlinks."""
