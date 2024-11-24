@@ -234,12 +234,10 @@ def normalize_filename(filename: str) -> str:
 
 def check_and_fix_symlink(symlink_path, file_map):
     """Check and fix a single symlink with atomic operations and caching."""
-    nonlocal missing_files
-
-    if isinstance(symlink_path, tuple):
-        symlink_path = symlink_path[0]
-
     try:
+        if isinstance(symlink_path, tuple):
+            symlink_path = symlink_path[0]
+
         target_path = os.readlink(symlink_path)
         filename = os.path.basename(target_path)
         dirname = os.path.dirname(target_path).split("/")[-1]
@@ -381,12 +379,10 @@ def fix_broken_symlinks(library_path, rclone_path, max_workers=4):
 
     def check_and_fix_symlink(symlink_path, file_map):
         """Check and fix a single symlink."""
-        nonlocal missing_files
-
-        if isinstance(symlink_path, tuple):
-            symlink_path = symlink_path[0]
-
         try:
+            if isinstance(symlink_path, tuple):
+                symlink_path = symlink_path[0]
+
             target_path = os.readlink(symlink_path)
             filename = os.path.basename(target_path)
             dirname = os.path.dirname(target_path).split("/")[-1]
