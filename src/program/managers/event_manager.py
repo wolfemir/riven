@@ -305,6 +305,13 @@ class EventManager:
         self.add_event_to_queue(event)
         return True
 
+    def add_event_to_running(self, event: Event):
+        """Add an event to the running events set."""
+        with self.mutex:
+            if event not in self._running_events:
+                self._running_events.add(event)
+                logger.debug(f"Added {event.log_message} to running events.")
+
     def add_item(self, item, service="Manual"):
         """
         Adds an item to the queue as an event.
