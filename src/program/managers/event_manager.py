@@ -222,26 +222,22 @@ class EventManager:
 
         logger.debug(f"Canceled jobs for Item ID {item_id} and its children.")
 
-    def next(self):
-        """
-        Get the next event in the queue with an optional timeout.
+    def next(self) -> Event:
+        """Get the next event from the queue."""
+        with self.mutex:
+            if not self._queued_events:
+                raise Empty()
+            event = next(iter(self._queued_events))
+            return event
 
-        Raises:
-            Empty: If the queue is empty.
-
-        Returns:
-            Event: The next event in the queue.
-        """
-        while True:
-            if self._queued_events:
-                with self.mutex:
-                    events = list(self._queued_events)
-                    events.sort(key=lambda event: event.run_at)
-                    if datetime.now() >= events[0].run_at:
-                        event = events.pop(0)
-                        self._queued_events.discard(event)
-                        return event
-            raise Empty
+    def add_event_to_running(self, event: Event):
+        """Add an event to the running events set."""
+        with self.mutex:
+            if event not in self._running_events:
+                self._running_events.add(event)
+                logger.debug(f"Added {event.log_message} to running events.")
+                # Remove from queued events when moving to running
+                self._queued_events.discard(event)
 
     def _id_in_queue(self, _id):
         """
@@ -267,50 +263,18 @@ class EventManager:
         """
         return any(event.item_id == _id for event in self._running_events)
 
-    def add_event(self, event: Event):
-        """
-        Adds an event to the queue if it is not already present in the queue or running events.
-
-        Args:
-            event (Event): The event to add to the queue.
-
-        Returns:
-            bool: True if the event was added to the queue, False if it was already present.
-        """
-        # Check if the event's item is a show and its seasons or episodes are in the queue or running
-        with db.Session() as session:
-            item_id, related_ids = db_functions.get_item_ids(session, event.item_id)
-        if item_id:
-            if self._id_in_queue(item_id):
-                logger.debug(f"Item ID {item_id} is already in the queue, skipping.")
-                return False
-            if self._id_in_running_events(item_id):
-                logger.debug(f"Item ID {item_id} is already running, skipping.")
-                return False
-            for related_id in related_ids:
-                if self._id_in_queue(related_id) or self._id_in_running_events(related_id):
-                    logger.debug(f"Child of Item ID {item_id} is already in the queue or running, skipping.")
-                    return False
-        else:
-            imdb_id = event.content_item.imdb_id
-            if any(event.content_item and event.content_item.imdb_id == imdb_id for event in self._queued_events):
-                logger.debug(f"Content Item with IMDB ID {imdb_id} is already in queue, skipping.")
-                return False
-            if any(
-                event.content_item and event.content_item.imdb_id == imdb_id for event in self._running_events
-            ):
-                logger.debug(f"Content Item with IMDB ID {imdb_id} is already running, skipping.")
-                return False
-
+    def add_event(self, event: Event) -> bool:
+        """Add an event with duplicate checking."""
+        if event.item_id in [e.item_id for e in self._running_events]:
+            logger.debug(f"Skipping {event.log_message} as it is already running.")
+            return False
+        
+        if event.item_id in [e.item_id for e in self._queued_events]:
+            logger.debug(f"Skipping {event.log_message} as it is already queued.")
+            return False
+        
         self.add_event_to_queue(event)
         return True
-
-    def add_event_to_running(self, event: Event):
-        """Add an event to the running events set."""
-        with self.mutex:
-            if event not in self._running_events:
-                self._running_events.add(event)
-                logger.debug(f"Added {event.log_message} to running events.")
 
     def add_item(self, item, service="Manual"):
         """
