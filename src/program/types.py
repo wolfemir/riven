@@ -41,12 +41,26 @@ class ProcessedEvent:
     service: Service
     related_media_items: list[MediaItem]
 
-@dataclass
+@dataclass(frozen=True)  # Make the dataclass immutable for safe hashing
 class Event:
     emitted_by: Service
     item_id: Optional[str] = None
     content_item: Optional[MediaItem] = None
     run_at: datetime = datetime.now()
+
+    def __hash__(self):
+        # Hash based on emitted_by, item_id, and content_item id if present
+        content_item_id = self.content_item.id if self.content_item else None
+        return hash((str(self.emitted_by.__class__.__name__), self.item_id, content_item_id))
+
+    def __eq__(self, other):
+        if not isinstance(other, Event):
+            return False
+        # Compare based on the same attributes used in hash
+        return (str(self.emitted_by.__class__.__name__) == str(other.emitted_by.__class__.__name__) and
+                self.item_id == other.item_id and
+                (self.content_item.id if self.content_item else None) == 
+                (other.content_item.id if other.content_item else None))
 
     @property
     def log_message(self):
