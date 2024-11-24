@@ -18,10 +18,12 @@ class Subliminal:
     def __init__(self):
         self.key = "subliminal"
         self.settings = settings_manager.settings.post_processing.subliminal
-        if not self.settings.enabled:
-            self.initialized = False
-            return
+        self.initialized = False
+        self._enabled = self.settings.enabled
         
+        if not self._enabled:
+            return
+
         # Configure region with better caching
         if not region.is_configured:
             region.configure("dogpile.cache.dbm", 
@@ -29,9 +31,11 @@ class Subliminal:
                                "filename": f"{root_dir}/data/subliminal.dbm",
                                "lock_timeout": 30
                            })
-        
+
         self.providers = ["gestdown", "opensubtitles", "opensubtitlescom", "podnapisi", "tvsubtitles"]
         self.provider_config = {}
+        self.pool = ProviderPool(providers=self.providers)
+
         for provider, value in self.settings.providers.items():
             if value["enabled"]:
                 self.provider_config[provider] = {
@@ -39,6 +43,8 @@ class Subliminal:
                     "password": value["password"]
                 }
         
+        self.pool.provider_configs = self.provider_config
+
         # Create thread pool for parallel provider initialization
         with ThreadPoolExecutor(max_workers=len(self.providers)) as executor:
             futures = []
@@ -51,12 +57,15 @@ class Subliminal:
                 except Exception as e:
                     logger.warning(f"Provider initialization failed: {str(e)}")
 
-        self.pool = ProviderPool(providers=self.providers, provider_configs=self.provider_config)
         self.languages = set(create_language_from_string(lang) for lang in self.settings.languages)
-        self.initialized = self.enabled
         self.subtitle_cache = {}
         self._max_workers = min(10, len(self.languages) * 2)  # Optimize worker count
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
+        self.initialized = True
+
+    @property
+    def enabled(self):
+        return self._enabled
 
     def _initialize_provider(self, provider):
         """Initialize a single provider with error handling."""
