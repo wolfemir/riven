@@ -10,6 +10,9 @@ from program.media.subtitle import Subtitle
 from program.settings.manager import settings_manager
 from program.utils import root_dir
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+
 
 class Subliminal:
     def __init__(self):
@@ -18,35 +21,143 @@ class Subliminal:
         if not self.settings.enabled:
             self.initialized = False
             return
+        
+        # Configure region with better caching
         if not region.is_configured:
-            region.configure("dogpile.cache.dbm", arguments={"filename": f"{root_dir}/data/subliminal.dbm"})
-        providers = ["gestdown","opensubtitles","opensubtitlescom","podnapisi","tvsubtitles"]
-        provider_config = {}
+            region.configure("dogpile.cache.dbm", 
+                           arguments={
+                               "filename": f"{root_dir}/data/subliminal.dbm",
+                               "lock_timeout": 30
+                           })
+        
+        self.providers = ["gestdown", "opensubtitles", "opensubtitlescom", "podnapisi", "tvsubtitles"]
+        self.provider_config = {}
         for provider, value in self.settings.providers.items():
             if value["enabled"]:
-                provider_config[provider] = {"username": value["username"], "password": value["password"]}
-        self.pool = ProviderPool(providers=providers,provider_configs=provider_config)
-        for provider in providers:
-            try:
-                self.pool[provider].initialize()
-                if self.pool.provider_configs.get(provider, False):
-                    if provider == "opensubtitlescom":
-                        self.pool[provider].login()
-                        if not self.pool[provider].check_token():
-                            raise AuthenticationError
-            except Exception:
-                logger.warning(f"Could not initialize provider: {provider}.")
-                if provider == "opensubtitlescom":
-                    self.pool.initialized_providers.pop(provider)
-                    self.pool.provider_configs.pop(provider)
-                    self.pool[provider].initialize()
-                    logger.warning("Using default opensubtitles.com provider.")
+                self.provider_config[provider] = {
+                    "username": value["username"],
+                    "password": value["password"]
+                }
+        
+        # Create thread pool for parallel provider initialization
+        with ThreadPoolExecutor(max_workers=len(self.providers)) as executor:
+            futures = []
+            for provider in self.providers:
+                futures.append(executor.submit(self._initialize_provider, provider))
+            
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.warning(f"Provider initialization failed: {str(e)}")
+
+        self.pool = ProviderPool(providers=self.providers, provider_configs=self.provider_config)
         self.languages = set(create_language_from_string(lang) for lang in self.settings.languages)
         self.initialized = self.enabled
+        self.subtitle_cache = {}
+        self._max_workers = min(10, len(self.languages) * 2)  # Optimize worker count
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
 
-    @property
-    def enabled(self):
-        return self.settings.enabled
+    def _initialize_provider(self, provider):
+        """Initialize a single provider with error handling."""
+        try:
+            self.pool[provider].initialize()
+            if self.provider_config.get(provider):
+                if provider == "opensubtitlescom":
+                    self.pool[provider].login()
+                    if not self.pool[provider].check_token():
+                        raise AuthenticationError
+        except Exception as e:
+            logger.warning(f"Could not initialize provider: {provider}. Error: {str(e)}")
+            if provider == "opensubtitlescom":
+                self.pool.initialized_providers.pop(provider, None)
+                self.provider_config.pop(provider, None)
+                self.pool[provider].initialize()
+                logger.warning("Using default opensubtitles.com provider.")
+            raise
+
+    @lru_cache(maxsize=128)
+    def _get_video_info(self, real_name):
+        """Cache video information parsing."""
+        return Video.fromname(real_name)
+
+    def get_subtitles(self, item):
+        if item.type not in ["movie", "episode"]:
+            return {}
+
+        real_name = pathlib.Path(item.symlink_path).resolve().name
+        try:
+            video = self._get_video_info(real_name)
+            video.symlink_path = item.symlink_path
+            video.subtitle_languages = get_existing_subtitles(
+                pathlib.Path(item.symlink_path).stem,
+                pathlib.Path(item.symlink_path).parent
+            )
+
+            # Parallel subtitle listing and downloading
+            futures = []
+            with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+                for language in self.languages:
+                    if language not in video.subtitle_languages:
+                        futures.append(
+                            executor.submit(
+                                self.pool.list_subtitles,
+                                video,
+                                {language}
+                            )
+                        )
+
+            all_subtitles = []
+            for future in as_completed(futures):
+                try:
+                    subtitles = future.result()
+                    if subtitles:
+                        all_subtitles.extend(subtitles)
+                except Exception as e:
+                    logger.error(f"Error listing subtitles: {str(e)}")
+
+            if all_subtitles:
+                return video, self.pool.download_best_subtitles(all_subtitles, video, self.languages)
+            return video, []
+
+        except ValueError:
+            logger.error(f"Could not parse video name: {real_name}")
+        return {}
+
+    def save_subtitles(self, video, subtitles, item):
+        """Save subtitles with parallel processing."""
+        if not subtitles:
+            return
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=min(len(subtitles), 5)) as executor:
+            for subtitle in subtitles:
+                original_name = video.name
+                video.name = pathlib.Path(video.symlink_path)
+                futures.append(
+                    executor.submit(
+                        self._save_single_subtitle,
+                        video,
+                        subtitle,
+                        item,
+                        original_name
+                    )
+                )
+
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error saving subtitle: {str(e)}")
+
+    def _save_single_subtitle(self, video, subtitle, item, original_name):
+        """Save a single subtitle with proper cleanup."""
+        try:
+            saved = save_subtitles(video, [subtitle])
+            for saved_sub in saved:
+                logger.info(f"Downloaded ({saved_sub.language}) subtitle for {pathlib.Path(item.symlink_path).stem}")
+        finally:
+            video.name = original_name
 
     def scan_files_and_download(self):
         # Do we want this?
@@ -61,28 +172,6 @@ class Subliminal:
         #     for subtitle in saved:
         #         logger.info(f"Downloaded ({subtitle.language}) subtitle for {pathlib.Path(video.symlink).stem}")
 
-    def get_subtitles(self, item):
-        if item.type in ["movie", "episode"]:
-            real_name = pathlib.Path(item.symlink_path).resolve().name
-            try:
-                video = Video.fromname(real_name)
-                video.symlink_path = item.symlink_path
-                video.subtitle_languages = get_existing_subtitles(pathlib.Path(item.symlink_path).stem, pathlib.Path(item.symlink_path).parent)
-                return video, self.pool.download_best_subtitles(self.pool.list_subtitles(video, self.languages), video, self.languages)
-            except ValueError:
-                logger.error(f"Could not parse video name: {real_name}")
-        return {}
-
-    def save_subtitles(self, video, subtitles, item):
-        for subtitle in subtitles:
-            original_name = video.name
-            video.name = pathlib.Path(video.symlink_path)
-            saved = save_subtitles(video, [subtitle])
-            for subtitle in saved:
-                logger.info(f"Downloaded ({subtitle.language}) subtitle for {pathlib.Path(item.symlink_path).stem}")
-            video.name = original_name
-
-
     def run(self, item):
         for language in self.languages:
             key = str(language)
@@ -94,7 +183,6 @@ class Subliminal:
         except Exception as e:
             logger.error(f"Failed to download subtitles for {item.log_string}: {e}")
 
-
     def update_item(self, item):
         folder = pathlib.Path(item.symlink_path).parent
         subs = get_existing_subtitles(pathlib.Path(item.symlink_path).stem, folder)
@@ -105,8 +193,10 @@ class Subliminal:
                     subtitle.file = (folder / lang.file).__str__()
                     break
 
+    @staticmethod
     def should_submit(item):
         return item.type in ["movie", "episode"] and not any(subtitle.file is not None for subtitle in item.subtitles)
+
 
 def _scan_videos(directory):
     """
@@ -129,6 +219,7 @@ def _scan_videos(directory):
                 videos.append(video)
     return videos
 
+
 def create_language_from_string(lang: str) -> Language:
     try:
         if len(lang) == 2:
@@ -138,6 +229,7 @@ def create_language_from_string(lang: str) -> Language:
     except ValueError:
         logger.error(f"Invalid language code: {lang}")
         return None
+
 
 def get_existing_subtitles(filename: str, path: pathlib.Path) -> set[Language]:
     subtitle_languages = set()
