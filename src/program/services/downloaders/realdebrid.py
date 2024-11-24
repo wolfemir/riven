@@ -424,71 +424,180 @@ class RealDebridDownloader(DownloaderBase):
             
         return False
 
+    def wait_for_download(self, torrent_id: str, content_id: str, item: MediaItem) -> dict:
+        """Wait for torrent to finish downloading"""
+        start_time = time.time()
+        last_check_time = time.time()
+        zero_seeder_count = 0  # Track consecutive zero seeder checks
+        last_progress = -1  # Track progress changes
+        stalled_time = 0  # Track how long progress has been stalled
+        
+        while True:
+            try:
+                info = self.get_torrent_info(torrent_id)
+                status = RDTorrentStatus(info.get("status", ""))
+                seeders = info.get("seeders", 0)
+                filename = info.get("filename", "Unknown")
+                progress = info.get("progress", 0)
+                current_time = time.time()
+                
+                # Handle queued torrents with more patience
+                if status == RDTorrentStatus.QUEUED:
+                    self.queue_attempts[content_id] += 1
+                    if self.queue_attempts[content_id] >= self.MAX_QUEUE_ATTEMPTS:
+                        logger.warning(f"Hit maximum queue attempts ({self.MAX_QUEUE_ATTEMPTS}) for {filename}")
+                        raise QueuedTooManyTimesError(f"Too many queued attempts for {filename}")
+                    
+                    # Wait longer between queue checks
+                    wait_time = min(30 * (2 ** (self.queue_attempts[content_id] - 1)), 300)  # Max 5 minutes
+                    logger.debug(f"{filename} is queued on Real-Debrid (attempt {self.queue_attempts[content_id]}/{self.MAX_QUEUE_ATTEMPTS}), waiting {wait_time}s before retry")
+                    time.sleep(wait_time)
+                    continue
+
+                # Track progress changes and stalls
+                if progress != last_progress:
+                    last_progress = progress
+                    stalled_time = 0
+                else:
+                    stalled_time = current_time - last_check_time
+
+                # Check status and progress every minute
+                if current_time - last_check_time >= 60:
+                    logger.debug(f"{filename} status: {status}, progress: {progress}%, seeders: {seeders}")
+                    
+                    # Handle stalled downloads
+                    if stalled_time > 300 and status == RDTorrentStatus.DOWNLOADING:  # 5 minutes with no progress
+                        logger.warning(f"{filename} download stalled for {int(stalled_time)}s at {progress}%")
+                        if seeders == 0:
+                            zero_seeder_count += 1
+                            logger.debug(f"{filename} has no seeders ({zero_seeder_count}/2 checks)")
+                            if zero_seeder_count >= 2:
+                                logger.error(f"{filename} has no seeders available after 2 consecutive checks")
+                                self.delete_torrent(torrent_id)
+                                raise DownloadFailedError(f"{filename} has no seeders available")
+                        elif progress < 1:  # If download hasn't started and we have seeders, be more patient
+                            if stalled_time > 600:  # 10 minutes with no start
+                                logger.error(f"{filename} failed to start downloading after {int(stalled_time)}s")
+                                self.delete_torrent(torrent_id)
+                                raise DownloadFailedError(f"{filename} failed to start downloading")
+                        else:  # Download started but stalled with seeders
+                            if stalled_time > 900:  # 15 minutes stalled mid-download
+                                logger.error(f"{filename} stalled at {progress}% for {int(stalled_time)}s")
+                                self.delete_torrent(torrent_id)
+                                raise DownloadFailedError(f"{filename} download stalled")
+                    
+                    last_check_time = current_time
+
+                if status == RDTorrentStatus.DOWNLOADED:
+                    logger.info(f"{filename} download completed successfully")
+                    return info
+                elif status in (RDTorrentStatus.ERROR, RDTorrentStatus.MAGNET_ERROR, RDTorrentStatus.DEAD):
+                    logger.error(f"{filename} failed with status: {status}")
+                    self.delete_torrent(torrent_id)
+                    raise DownloadFailedError(f"{filename} failed with status: {status}")
+
+                # Check if we've exceeded the timeout
+                if current_time - start_time > self.DOWNLOAD_TIMEOUT:
+                    logger.error(f"{filename} download timed out after {self.DOWNLOAD_TIMEOUT} seconds")
+                    self.delete_torrent(torrent_id)
+                    raise DownloadFailedError(f"{filename} download timed out")
+
+                time.sleep(self.DOWNLOAD_POLL_INTERVAL)
+                
+            except Exception as e:
+                if isinstance(e, (DownloadFailedError, QueuedTooManyTimesError)):
+                    raise
+                logger.error(f"Error checking download status for {item.log_string}: {str(e)}")
+                time.sleep(5)  # Wait before retry on unexpected errors
+
     def download_cached_stream(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
         """Download a stream from Real-Debrid"""
         if not self.initialized:
             raise RealDebridError("Downloader not properly initialized")
 
         content_id = str(item.id)
+        retry_count = 0
+        MAX_RETRIES = 3
 
-        # Check if content already has a successful download
-        if self._is_content_complete(content_id):
-            logger.info(f"Skipping download for {item.log_string} - another download already completed")
-            return DownloadCachedStreamResult(None, None, None, stream.infohash)
+        while retry_count < MAX_RETRIES:
+            try:
+                # Check if content already has a successful download
+                if self._is_content_complete(content_id):
+                    logger.info(f"Skipping download for {item.log_string} - another download already completed")
+                    return DownloadCachedStreamResult(None, None, None, stream.infohash)
 
-        # Check if we can start a new download for this content
-        if not self._can_start_download(content_id):
-            logger.warning(f"Cannot start download for {item.log_string} - max concurrent downloads reached")
-            return DownloadCachedStreamResult(None, None, None, stream.infohash)
+                # Check if we can start a new download for this content
+                if not self._can_start_download(content_id):
+                    logger.warning(f"Cannot start download for {item.log_string} - max concurrent downloads reached")
+                    return DownloadCachedStreamResult(None, None, None, stream.infohash)
 
-        torrent_id = None
-        try:
-            # Add torrent and get initial info
-            torrent_id = self.add_torrent(stream.infohash)
-            self._add_active_download(content_id, torrent_id)
-            
-            info = self.get_torrent_info(torrent_id)
-
-            # Process files to find valid video files
-            files = info.get("files", [])
-            container = self._process_files(files)
-            if not container:
-                logger.debug(f"No valid video files found in torrent {torrent_id}")
-                return DownloadCachedStreamResult(None, torrent_id, info, stream.infohash)
-
-            # Select all files by default
-            self.select_files(torrent_id, list(container.keys()))
-
-            # Wait for download to complete
-            info = self.wait_for_download(torrent_id, content_id, item)
-            
-            logger.log("DEBRID", f"Downloading {item.log_string} from '{stream.raw_title}' [{stream.infohash}]")
-            
-            # Mark content as complete since download succeeded
-            self._mark_content_complete(content_id)
-            # Reset queue attempts on successful download
-            self.queue_attempts[content_id] = 0
-            
-            return DownloadCachedStreamResult(container, torrent_id, info, stream.infohash)
-            
-        except QueuedTooManyTimesError:
-            # Don't blacklist the stream, but mark the item for retry later based on scrape count
-            retry_hours = self._get_retry_hours(item.scraped_times)
-            retry_time = datetime.now() + timedelta(hours=retry_hours)
-            logger.warning(f"Too many queued attempts for {item.log_string}, will retry after {retry_hours} hours")
-            item.set("retry_after", retry_time)
-            return DownloadCachedStreamResult(None, torrent_id, None, stream.infohash)
-        except Exception as e:
-            # Clean up torrent if something goes wrong
-            if torrent_id:
+                torrent_id = None
                 try:
-                    self.delete_torrent(torrent_id)
-                except Exception as delete_error:
-                    logger.error(f"Failed to delete torrent {torrent_id} after error: {delete_error}")
-            raise
-        finally:
-            if torrent_id:
-                self._remove_active_download(content_id, torrent_id)
+                    # Add torrent and get initial info
+                    torrent_id = self.add_torrent(stream.infohash)
+                    self._add_active_download(content_id, torrent_id)
+                    
+                    info = self.get_torrent_info(torrent_id)
+                    if not info:
+                        raise RealDebridError("Failed to get torrent info")
+
+                    # Process files to find valid video files
+                    files = info.get("files", [])
+                    container = self._process_files(files)
+                    if not container:
+                        logger.debug(f"No valid video files found in torrent {torrent_id}")
+                        return DownloadCachedStreamResult(None, torrent_id, info, stream.infohash)
+
+                    # Select all files by default
+                    self.select_files(torrent_id, list(container.keys()))
+
+                    # Wait for download to complete
+                    info = self.wait_for_download(torrent_id, content_id, item)
+                    
+                    logger.log("DEBRID", f"Successfully downloaded {item.log_string} from '{stream.raw_title}' [{stream.infohash}]")
+                    
+                    # Mark content as complete since download succeeded
+                    self._mark_content_complete(content_id)
+                    # Reset queue attempts on successful download
+                    self.queue_attempts[content_id] = 0
+                    
+                    return DownloadCachedStreamResult(container, torrent_id, info, stream.infohash)
+                    
+                except QueuedTooManyTimesError:
+                    # Don't blacklist the stream, but mark the item for retry later based on scrape count
+                    retry_hours = self._get_retry_hours(item.scraped_times)
+                    retry_time = datetime.now() + timedelta(hours=retry_hours)
+                    logger.warning(f"Too many queued attempts for {item.log_string}, will retry after {retry_hours} hours")
+                    item.set("retry_after", retry_time)
+                    return DownloadCachedStreamResult(None, torrent_id, None, stream.infohash)
+                    
+                except Exception as e:
+                    if "403" in str(e):  # Handle rate limiting or authentication issues
+                        retry_count += 1
+                        wait_time = 60 * (2 ** retry_count)  # Exponential backoff
+                        logger.warning(f"Rate limit or auth error, retrying in {wait_time}s (attempt {retry_count}/{MAX_RETRIES})")
+                        time.sleep(wait_time)
+                        continue
+                    raise
+                finally:
+                    if torrent_id:
+                        try:
+                            self.delete_torrent(torrent_id)
+                        except Exception as delete_error:
+                            logger.error(f"Failed to delete torrent {torrent_id}: {delete_error}")
+                        self._remove_active_download(content_id, torrent_id)
+                        
+            except Exception as e:
+                retry_count += 1
+                if retry_count < MAX_RETRIES:
+                    wait_time = 30 * (2 ** retry_count)
+                    logger.warning(f"Download attempt {retry_count} failed for {item.log_string}, retrying in {wait_time}s: {str(e)}")
+                    time.sleep(wait_time)
+                    continue
+                logger.error(f"All download attempts failed for {item.log_string}: {str(e)}")
+                raise
+
+        return DownloadCachedStreamResult(None, None, None, stream.infohash)
 
     def _get_retry_hours(self, scrape_times: int) -> float:
         """Get retry hours based on number of scrape attempts."""
@@ -499,62 +608,3 @@ class RealDebridDownloader(DownloaderBase):
         elif scrape_times >= 2:
             return self.scraping_settings.after_2
         return 2.0  # Default to 2 hours
-
-    def wait_for_download(self, torrent_id: str, content_id: str, item: MediaItem) -> dict:
-        """Wait for torrent to finish downloading"""
-        start_time = time.time()
-        last_check_time = time.time()
-        zero_seeder_count = 0  # Track consecutive zero seeder checks
-        
-        while True:
-            info = self.get_torrent_info(torrent_id)
-            status = RDTorrentStatus(info.get("status", ""))
-            seeders = info.get("seeders", 0)
-            filename = info.get("filename", "Unknown")
-            progress = info.get("progress", 0)
-            current_time = time.time()
-            
-            # Handle queued torrents
-            if status == RDTorrentStatus.QUEUED:
-                self.queue_attempts[content_id] += 1
-                if self.queue_attempts[content_id] >= self.MAX_QUEUE_ATTEMPTS:
-                    logger.warning(f"Hit maximum queue attempts ({self.MAX_QUEUE_ATTEMPTS}) for content {content_id}")
-                    raise QueuedTooManyTimesError(f"Too many queued attempts for {filename}")
-                
-                logger.debug(f"{filename} is queued on Real-Debrid (attempt {self.queue_attempts[content_id]}/{self.MAX_QUEUE_ATTEMPTS}), blacklisting and trying next stream")
-                raise DownloadFailedError(f"{filename} is queued on Real-Debrid")
-            
-            # Check status and seeders every minute
-            if current_time - last_check_time >= 60:  # Check every minute
-                logger.debug(f"{filename} status: {status}, seeders: {seeders}")
-                if "progress" in info:
-                    logger.debug(f"{filename} progress: \033[95m{progress}%\033[0m")
-                    
-                # Only check seeders if download is not complete
-                if progress < 100 and status == RDTorrentStatus.DOWNLOADING:
-                    if seeders == 0:
-                        zero_seeder_count += 1
-                        logger.debug(f"{filename} has no seeders ({zero_seeder_count}/2 checks)")
-                        if zero_seeder_count >= 2:  # Give up after 2 consecutive zero seeder checks
-                            logger.error(f"{filename} has no seeders available after 2 consecutive checks")
-                            self.delete_torrent(torrent_id)
-                            raise DownloadFailedError(f"{filename} has no seeders available after 2 consecutive checks")
-                    else:
-                        zero_seeder_count = 0  # Reset counter if we find seeders
-                    
-                last_check_time = current_time
-
-            if status == RDTorrentStatus.DOWNLOADED:
-                return info
-            elif status in (RDTorrentStatus.ERROR, RDTorrentStatus.MAGNET_ERROR, RDTorrentStatus.DEAD):
-                logger.error(f"{filename} failed with status: {status}")
-                self.delete_torrent(torrent_id)
-                raise DownloadFailedError(f"{filename} failed with status: {status}")
-
-            # Check if we've exceeded the timeout
-            if current_time - start_time > self.DOWNLOAD_TIMEOUT:
-                logger.error(f"{filename} download timed out after {self.DOWNLOAD_TIMEOUT} seconds")
-                self.delete_torrent(torrent_id)
-                raise DownloadFailedError(f"{filename} download timed out")
-
-            time.sleep(self.DOWNLOAD_POLL_INTERVAL)
