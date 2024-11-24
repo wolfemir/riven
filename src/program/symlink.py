@@ -4,11 +4,15 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Union
+import re
+import time
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, and_
+from sqlalchemy.orm import Session
 
 from program.db.db import db
+from program.types import Event, EventType
 from program.media.item import Episode, MediaItem, Movie, Season, Show
 from program.media.state import States
 from program.settings.manager import settings_manager
@@ -161,31 +165,62 @@ class Symlinker:
         destination = self._create_item_folders(item, symlink_filename)
 
         try:
-            if os.path.islink(destination):
+            # Create parent directories if they don't exist
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+
+            # Create temporary symlink with unique suffix
+            temp_link = f"{destination}.tmp"
+            if os.path.exists(temp_link) or os.path.islink(temp_link):
+                os.remove(temp_link)
+
+            # Create the new symlink as temporary first
+            os.symlink(source, temp_link)
+
+            # Verify the temporary symlink
+            if not os.path.exists(temp_link):
+                logger.error(f"Failed to create temporary symlink at {temp_link} for {item.log_string}")
+                return False
+
+            actual_target = os.path.realpath(temp_link)
+            expected_target = os.path.realpath(source)
+            if actual_target != expected_target:
+                logger.error(f"Symlink validation failed: {temp_link} points to {actual_target} instead of {expected_target}")
+                os.remove(temp_link)
+                return False
+
+            # Only after successful creation and validation, replace the old symlink
+            if os.path.exists(destination) or os.path.islink(destination):
                 os.remove(destination)
-            os.symlink(source, destination)
+
+            # Atomic rename of temporary symlink to final destination
+            os.rename(temp_link, destination)
+
+            # Update item attributes
+            item.set("symlinked", True)
+            item.set("symlinked_at", datetime.now())
+            item.set("symlinked_times", item.symlinked_times + 1)
+            item.set("symlink_path", destination)
+            logger.debug(f"Successfully created symlink for {item.log_string} at {destination}")
+            return True
+
         except PermissionError as e:
-            # This still creates the symlinks, however they will have wrong perms. User needs to fix their permissions.
-            # TODO: Maybe we validate symlink class by symlinking a test file, then try removing it and see if it still exists
-            logger.exception(f"Permission denied when creating symlink for {item.log_string}: {e}")
+            logger.error(f"Permission denied when creating symlink for {item.log_string}: {e}")
         except OSError as e:
             if e.errno == 36:
-                # This will cause a loop if it hits this.. users will need to fix their paths
-                # TODO: Maybe create an alternative naming scheme to cover this?
                 logger.error(f"Filename too long when creating symlink for {item.log_string}: {e}")
             else:
                 logger.error(f"OS error when creating symlink for {item.log_string}: {e}")
-            return False
-
-        if Path(destination).readlink() != source:
-            logger.error(f"Symlink validation failed: {destination} does not point to {source} for {item.log_string}")
-            return False
-
-        item.set("symlinked", True)
-        item.set("symlinked_at", datetime.now())
-        item.set("symlinked_times", item.symlinked_times + 1)
-        item.set("symlink_path", destination)
-        return True
+        except Exception as e:
+            logger.error(f"Unexpected error creating symlink for {item.log_string}: {e}")
+        
+        # Clean up temporary symlink if it exists after any error
+        if os.path.exists(temp_link) or os.path.islink(temp_link):
+            try:
+                os.remove(temp_link)
+            except Exception as e:
+                logger.error(f"Failed to clean up temporary symlink {temp_link}: {e}")
+        
+        return False
 
     def _create_item_folders(self, item: Union[Movie, Show, Season, Episode], filename: str) -> str:
         """Create necessary folders and determine the destination path for symlinks."""
@@ -277,6 +312,300 @@ class Symlinker:
                 return False
             return self.delete_item_symlinks(item)
 
+    def check_and_requeue_broken_symlinks(self) -> None:
+        """Check for broken symlinks in library paths and requeue them for processing."""
+        logger.info("Starting broken symlink check...")
+        
+        paths_to_check = [
+            self.library_path_movies,
+            self.library_path_shows,
+            self.library_path_anime_movies,
+            self.library_path_anime_shows
+        ]
+        
+        broken_links = []
+        for base_path in paths_to_check:
+            if not base_path.exists():
+                continue
+                
+            # Walk through all directories
+            for root, _, files in os.walk(base_path):
+                for filename in files:
+                    full_path = Path(root) / filename
+                    if full_path.is_symlink():
+                        try:
+                            # Check if symlink is broken
+                            if not os.path.exists(os.path.realpath(full_path)):
+                                broken_links.append(full_path)
+                                logger.warning(f"Found broken symlink: {full_path}")
+                        except Exception as e:
+                            logger.error(f"Error checking symlink {full_path}: {e}")
+                            broken_links.append(full_path)
+
+        if not broken_links:
+            logger.info("No broken symlinks found.")
+            return
+
+        logger.info(f"Found {len(broken_links)} broken symlinks. Checking database and requeueing...")
+
+        with db.Session() as session:
+            for link_path in broken_links:
+                try:
+                    # Extract item information from the symlink path
+                    relative_path = str(link_path.relative_to(self.library_path_movies if 'movies' in str(link_path) else self.library_path_shows))
+                    
+                    # Try to find the item in the database
+                    query = None
+                    if 'movies' in str(link_path):
+                        # Extract movie title and year from filename
+                        match = re.match(r"(.+?)\s*\((\d{4})\)\s*{imdb-([^}]+)}", link_path.parent.name)
+                        if match:
+                            title, year, imdb_id = match.groups()
+                            query = select(Movie).where(Movie.imdb_id == imdb_id)
+                    else:
+                        # For TV shows, extract show title and year
+                        show_dir = None
+                        for parent in link_path.parents:
+                            if match := re.match(r"(.+?)\s*\((\d{4})\)\s*{imdb-([^}]+)}", parent.name):
+                                show_dir = parent
+                                break
+                        
+                        if show_dir and (match := re.match(r"(.+?)\s*\((\d{4})\)\s*{imdb-([^}]+)}", show_dir.name)):
+                            title, year, imdb_id = match.groups()
+                            query = select(Episode).join(Season).join(Show).where(Show.imdb_id == imdb_id)
+                            
+                            # If it's an episode, try to extract season and episode numbers
+                            if episode_match := re.match(r".+?s(\d{2})e(\d{2})", link_path.stem):
+                                season_num, episode_num = map(int, episode_match.groups())
+                                query = query.where(
+                                    and_(
+                                        Season.number == season_num,
+                                        Episode.number == episode_num
+                                    )
+                                )
+
+                    if query:
+                        item = session.execute(query).unique().scalar_one_or_none()
+                        if item:
+                            # Reset symlink status
+                            item.set("symlinked", False)
+                            item.set("symlink_path", None)
+                            
+                            # Add to event queue for reprocessing
+                            event = Event(
+                                event_type=EventType.SYMLINK,
+                                media_item_id=item.id,
+                                priority=1  # Higher priority for broken link fixes
+                            )
+                            session.add(event)
+                            logger.info(f"Requeued {item.log_string} for symlink creation")
+                        else:
+                            logger.warning(f"Could not find database entry for broken symlink: {link_path}")
+                    
+                        # Remove the broken symlink
+                        if os.path.islink(link_path):
+                            os.remove(link_path)
+                            logger.debug(f"Removed broken symlink: {link_path}")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing broken symlink {link_path}: {e}")
+                    continue
+            
+            try:
+                session.commit()
+                logger.info("Successfully committed broken symlink fixes to database")
+            except Exception as e:
+                logger.error(f"Error committing broken symlink fixes to database: {e}")
+                session.rollback()
+
+    def get_items_from_filepath(self, filepath: str) -> Optional[MediaItem]:
+        """Extract item information from filepath and find matching database entry."""
+        try:
+            path = Path(filepath)
+            imdb_match = None
+            season_num = None
+            episode_num = None
+
+            # Search for IMDB ID in parent directories
+            for parent in path.parents:
+                if match := re.search(r'{imdb-([^}]+)}', parent.name):
+                    imdb_match = match.group(1)
+                    break
+
+            if not imdb_match:
+                logger.debug(f"No IMDB ID found in path: {filepath}")
+                return None
+
+            # Extract season and episode numbers for TV shows
+            if 'Season' in filepath:
+                # Try different episode naming patterns
+                patterns = [
+                    r's(\d{1,2})e(\d{1,2}(?:-e\d{1,2})?)',  # s01e01 or s01e01-e02
+                    r'[Ss]eason\s*(\d{1,2}).*?[Ee]pisode\s*(\d{1,2})',  # Season 01 Episode 01
+                    r'[. _-](\d{1,2})x(\d{1,2})[. _-]',  # 1x01
+                    r'- s(\d{2})e(\d{2})',  # - s01e01
+                ]
+                
+                for pattern in patterns:
+                    if match := re.search(pattern, str(path), re.IGNORECASE):
+                        season_num = int(match.group(1))
+                        episode_num = int(match.group(2).split('-')[0])  # Take first episode number if range
+                        break
+
+            with db.Session() as session:
+                if season_num is not None and episode_num is not None:
+                    # TV Show episode
+                    query = (
+                        select(Episode)
+                        .join(Season)
+                        .join(Show)
+                        .where(
+                            Show.imdb_id == imdb_match,
+                            Season.number == season_num,
+                            Episode.number == episode_num
+                        )
+                    )
+                    item = session.execute(query).scalar_one_or_none()
+                    if item:
+                        return item
+                    else:
+                        logger.debug(f"No episode found for {imdb_match} S{season_num:02d}E{episode_num:02d}")
+                else:
+                    # Movie
+                    query = select(Movie).where(Movie.imdb_id == imdb_match)
+                    item = session.execute(query).scalar_one_or_none()
+                    if item:
+                        return item
+                    else:
+                        logger.debug(f"No movie found for IMDB ID: {imdb_match}")
+
+        except Exception as e:
+            logger.error(f"Error extracting item from filepath {filepath}: {e}")
+
+        return None
+
+    def check_and_fix_symlink(self, symlink_path: str, max_attempts: int = 5, initial_wait: int = 5) -> bool:
+        """Check if a symlink is broken and attempt to fix it."""
+        try:
+            symlink_path = Path(symlink_path)
+            if not symlink_path.is_symlink():
+                return True  # Not a symlink, nothing to fix
+
+            # Check if target exists
+            target = Path(os.readlink(symlink_path))
+            if target.exists():
+                return True  # Symlink is good
+
+            # Get the item from database
+            item = self.get_items_from_filepath(str(symlink_path))
+            if not item:
+                logger.warning(f"Could not find item in database for path: {symlink_path}")
+                return False
+
+            # Try to find the correct file path
+            wait_time = initial_wait
+            attempts_left = max_attempts
+            
+            while attempts_left > 0:
+                source = _get_item_path(item)
+                if source and Path(source).exists():
+                    # Remove old symlink and create new one
+                    try:
+                        symlink_path.unlink()
+                        os.symlink(source, symlink_path)
+                        logger.info(f"Fixed symlink for {item.log_string} at {symlink_path}")
+                        return True
+                    except Exception as e:
+                        logger.error(f"Failed to create new symlink for {item.log_string}: {e}")
+                        return False
+
+                logger.debug(f"File {item.file} not found in rclone_path, waiting {wait_time} seconds. {attempts_left} attempts left.")
+                time.sleep(wait_time)
+                wait_time *= 2  # Exponential backoff
+                attempts_left -= 1
+
+            # If we couldn't find the file, check for existing torrents or requeue for scraping
+            with db.Session() as session:
+                try:
+                    # Refresh item in current session
+                    session.add(item)
+                    session.refresh(item)
+
+                    # Check if there are any existing torrents
+                    existing_torrents = session.execute(
+                        select(Torrent)
+                        .where(
+                            and_(
+                                Torrent.media_item_id == item.id,
+                                Torrent.state != States.FAILED
+                            )
+                        )
+                    ).scalars().all()
+
+                    if existing_torrents:
+                        logger.info(f"Found {len(existing_torrents)} existing torrents for {item.log_string}, checking status...")
+                        # Add download event if any torrent is ready
+                        for torrent in existing_torrents:
+                            if torrent.state in [States.READY, States.DOWNLOADED]:
+                                event = Event(
+                                    event_type=EventType.DOWNLOAD,
+                                    media_item_id=item.id,
+                                    priority=2  # Higher priority for missing files
+                                )
+                                session.add(event)
+                                logger.info(f"Added download event for existing torrent of {item.log_string}")
+                                break
+                    else:
+                        # No valid torrents found, queue for scraping
+                        logger.info(f"No valid torrents found for {item.log_string}, queueing for scraping")
+                        # Reset item state to allow re-scraping
+                        item.set("state", States.PENDING)
+                        item.set("scraped", False)
+                        item.set("scraped_at", None)
+                        
+                        # Add scrape event
+                        event = Event(
+                            event_type=EventType.SCRAPE,
+                            media_item_id=item.id,
+                            priority=2  # Higher priority for missing files
+                        )
+                        session.add(event)
+
+                    session.commit()
+                    logger.info(f"Successfully queued {item.log_string} for processing")
+
+                except Exception as e:
+                    logger.error(f"Error queueing {item.log_string} for processing: {e}")
+                    session.rollback()
+                    return False
+
+            logger.error(f"Failed to find source file for {item.log_string} after {max_attempts} attempts")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error checking/fixing symlink {symlink_path}: {e}")
+            return False
+
+    def process_directory(self, directory: str) -> None:
+        """Process a directory recursively to find and fix broken symlinks."""
+        try:
+            broken_links = []
+            for root, _, files in os.walk(directory):
+                for filename in files:
+                    filepath = Path(root) / filename
+                    if filepath.is_symlink() and not os.path.exists(os.readlink(filepath)):
+                        broken_links.append(filepath)
+
+            if broken_links:
+                logger.info(f"Found {len(broken_links)} broken symlinks in {directory}")
+                for link in broken_links:
+                    self.check_and_fix_symlink(str(link))
+            else:
+                logger.info(f"No broken symlinks found in {directory}")
+
+        except Exception as e:
+            logger.error(f"Error processing directory {directory}: {e}")
+
 def _delete_symlink(item: Union[Movie, Show], item_path: Path) -> bool:
     try:
         if item_path.exists():
@@ -294,26 +623,28 @@ def _delete_symlink(item: Union[Movie, Show], item_path: Path) -> bool:
         logger.error(f"Failed to delete symlink for {item.log_string}, error: {e}")
     return False
 
-def _get_item_path(item: Union[Movie, Episode]) -> Optional[Path]:
-    """Quickly check if the file exists in the rclone path."""
-    if not item.file:
+def _get_item_path(item: Union[Movie, Episode]) -> Optional[str]:
+    """Get the full path to the item's file in the rclone mount."""
+    if not item or not item.file:
         return None
 
-    rclone_path = Path(settings_manager.settings.symlink.rclone_path)
-    possible_folders = [item.folder, item.file, item.alternative_folder]
-    possible_folders_without_duplicates = list(set(possible_folders))
-    if len(possible_folders_without_duplicates) == 1:
-        new_possible_folder = Path(possible_folders_without_duplicates[0]).with_suffix("")
-        possible_folders_without_duplicates.append(new_possible_folder)
+    # First try the direct path from the item's folder
+    direct_path = str(Path(settings_manager.settings.symlink.rclone_path) / item.folder / item.file)
+    if os.path.exists(direct_path):
+        return direct_path
 
-    for folder in possible_folders_without_duplicates:
-        if folder:
-            file_path = rclone_path / folder / item.file
-            if file_path.exists():
-                return file_path
+    # Try alternative folder if available
+    if hasattr(item, "alternative_folder") and item.alternative_folder:
+        alt_path = str(Path(settings_manager.settings.symlink.rclone_path) / item.alternative_folder / item.file)
+        if os.path.exists(alt_path):
+            return alt_path
 
-    # Not in a folder? Perhaps it's just sitting in the root.
-    file = rclone_path / item.file
-    if file.exists() and file.is_file():
-        return file
+    # Search recursively in rclone path for the file
+    for root, _, files in os.walk(settings_manager.settings.symlink.rclone_path):
+        if item.file in files:
+            full_path = str(Path(root) / item.file)
+            # Update item's folder to reflect the actual location
+            item.folder = os.path.basename(root)
+            return full_path
+
     return None
