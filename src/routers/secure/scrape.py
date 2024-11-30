@@ -59,19 +59,21 @@ class ContainerFile(BaseModel):
 
 ContainerMap: TypeAlias = Dict[str, ContainerFile]
 
-class Container(RootModel[ContainerMap]):
+class Container(BaseModel):
     """
-    Root model for container mapping file IDs to file information.
+    Model for container mapping file IDs to file information.
 
     Example:
     {
-        "4": {
-            "filename": "show.s01e01.mkv",
-            "filesize": 30791392598
-        },
-        "5": {
-            "filename": "show.s01e02.mkv",
-            "filesize": 25573181861
+        "root": {
+            "4": {
+                "filename": "show.s01e01.mkv",
+                "filesize": 30791392598
+            },
+            "5": {
+                "filename": "show.s01e02.mkv",
+                "filesize": 25573181861
+            }
         }
     }
     """
@@ -219,12 +221,10 @@ def scrape_item(request: Request, id: str) -> ScrapeItemResponse:
                 .scalar_one_or_none()
             )
         streams = scraper.scrape(item)
-        stream_containers = downloader.get_instant_availability([stream for stream in streams.keys()])
-        for stream in streams.keys():
-            if len(stream_containers.get(stream, [])) > 0:
-                streams[stream].is_cached = True
-            else:
-                streams[stream].is_cached = False
+        # Check each stream individually since we can't batch check anymore
+        for infohash in streams.keys():
+            container = downloader.get_instant_availability(infohash, item.type)
+            streams[infohash].is_cached = container is not None
         log_string = item.log_string
 
     return {
@@ -280,8 +280,31 @@ async def start_manual_session(
     try:
         torrent_id = downloader.add_torrent(info_hash)
         torrent_info = downloader.get_torrent_info(torrent_id)
-        containers = downloader.get_instant_availability([session.magnet]).get(session.magnet, None)
-        session_manager.update_session(session.id, torrent_id=torrent_id, torrent_info=torrent_info, containers=containers)
+        container = downloader.get_instant_availability(info_hash, item.type)
+        # Convert TorrentInfo to dict and TorrentContainer to list of dicts for API response
+        torrent_info_dict = {
+            "id": torrent_info.id,
+            "name": torrent_info.name,
+            "status": torrent_info.status,
+            "infohash": torrent_info.infohash,
+            "bytes": torrent_info.bytes,
+            "created_at": torrent_info.created_at.isoformat(),
+            "files": torrent_info.files,
+            "progress": torrent_info.progress,
+            "alternative_filename": torrent_info.alternative_filename
+        }
+        containers_list = []
+        if container and container.files:
+            # Convert files list to ContainerMap format
+            container_map = {
+                str(file.file_id): {
+                    "filename": file.filename,
+                    "filesize": file.filesize
+                }
+                for file in container.files
+            }
+            containers_list = [{"root": container_map}]
+        session_manager.update_session(session.id, torrent_id=torrent_id, torrent_info=torrent_info_dict, containers=containers_list)
     except Exception as e:
         background_tasks.add_task(session_manager.abort_session, session.id)
         raise HTTPException(status_code=500, detail=str(e))
@@ -290,8 +313,8 @@ async def start_manual_session(
         "message": "Started manual scraping session",
         "session_id": session.id,
         "torrent_id": torrent_id,
-        "torrent_info": torrent_info,
-        "containers": containers,
+        "torrent_info": torrent_info_dict,
+        "containers": containers_list,
         "expires_at": session.expires_at.isoformat()
     }
 
@@ -314,8 +337,10 @@ def manual_select_files(request: Request, session_id, files: Container) -> Selec
         download_type = "cached"
 
     try:
-        downloader.select_files(session.torrent_id, files.model_dump())
-        session.selected_files = files.model_dump()
+        # Extract file IDs for selection and convert to integers
+        file_ids = [int(file_id) for file_id in files.root.keys()]
+        downloader.select_files(session.torrent_id, file_ids)
+        session.selected_files = files.root
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
