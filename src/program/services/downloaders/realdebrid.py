@@ -116,8 +116,8 @@ class RealDebridDownloader(DownloaderBase):
     CLEANUP_BATCH_SIZE = 10  # Process deletions in batches
     CLEANUP_SPEED_THRESHOLD = 50000  # 50 KB/s minimum speed
     CLEANUP_INACTIVE_TIME = 300  # 5 minutes of inactivity
-    MAX_CONCURRENT_TOTAL = 5  # Reduced from 10 to 5
-    MAX_CONCURRENT_PER_CONTENT = 2  # Reduced from 3 to 2
+    MAX_CONCURRENT_TOTAL = 9  # Increased from 5 to 9
+    MAX_CONCURRENT_PER_CONTENT = 4  # Increased from 2 to 4
 
     def __init__(self, api_key: str, proxy_url: Optional[str] = None):
         super().__init__()
