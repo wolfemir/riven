@@ -421,20 +421,24 @@ class Movie(MediaItem):
         "polymorphic_load": "inline",
     }
 
-    def copy(self, other):
-        super().copy(other)
-        return self
-
     def __init__(self, item):
         self.type = MovieMediaType.Movie.value
         self.file = item.get("file", None)
         super().__init__(item)
 
+    def name(self) -> str:
+        """Get the name of the movie (title)"""
+        return self.title if hasattr(self, 'title') else 'Unknown Movie'
+
+    def copy(self, other):
+        self.file = other.file
+        super().copy(other)
+
     def __repr__(self):
-        return f"Movie:{self.log_string}:{self.state.name}"
+        return f"<Movie {self.id}>"
 
     def __hash__(self):
-        return super().__hash__()
+        return hash(self.id)
 
 class Show(MediaItem):
     """Show class"""
