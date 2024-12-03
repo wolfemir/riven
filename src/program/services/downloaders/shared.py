@@ -77,6 +77,14 @@ class DownloadCachedStreamResult:
         self.success = success
         self.error = error
 
+class TorrentAddResult:
+    """Result object for torrent addition operations"""
+    def __init__(self, torrent_id=None, info=None, success=True, error=None):
+        self.torrent_id = torrent_id
+        self.info = info
+        self.success = success
+        self.error = error
+
 class FileFinder:
     """
     A class that helps you find files.

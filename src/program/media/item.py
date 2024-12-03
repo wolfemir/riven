@@ -669,6 +669,17 @@ class Episode(MediaItem):
         if self.parent and isinstance(self.parent, Season):
             self.is_anime = self.parent.parent.is_anime
 
+    @property
+    def name(self) -> str:
+        """Get a formatted name for the episode (e.g. 'S01E02')"""
+        if self.parent and self.number:
+            return f"S{self.parent.number:02d}E{self.number:02d}"
+        return f"Episode {self.number}" if self.number else "Unknown Episode"
+
+    @property
+    def log_string(self):
+        return f"{self.parent.log_string}E{self.number:02}"
+
     def __repr__(self):
         return f"Episode:{self.number}:{self.state.name}"
 
@@ -686,10 +697,6 @@ class Episode(MediaItem):
             raise ValueError("The file attribute must be a non-empty string.")
         # return list of episodes
         return parse(self.file).episodes
-
-    @property
-    def log_string(self):
-        return f"{self.parent.log_string}E{self.number:02}"
 
     def get_top_title(self) -> str:
         return self.parent.parent.title
