@@ -1196,14 +1196,29 @@ class RealDebridDownloader(DownloaderBase):
         try:
             # Get completed torrents
             completed_torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
+            
+            # Handle namespace response for downloads list
+            if hasattr(completed_torrents, 'list'):
+                completed_torrents = completed_torrents.list
 
             # Find matching torrent
             for torrent in completed_torrents:
-                torrent_id = torrent.get("id", "")
+                # Handle namespace response for torrent ID
+                if hasattr(torrent, 'id'):
+                    torrent_id = torrent.id
+                else:
+                    torrent_id = torrent.get("id", "")
+                    
                 info = self._get_torrent_info(torrent_id)
                 if info:
+                    # Handle namespace response for filename
+                    if hasattr(info, 'filename'):
+                        filename = info.filename
+                    else:
+                        filename = info.get("filename")
+                        
                     # Check if this torrent matches our item
-                    if info.get("filename") == item.name:
+                    if filename == item.name:
                         logger.info(f"✅ Found matching torrent {torrent_id} for {item.name}")
                         return DownloadCachedStreamResult(success=True, torrent_id=torrent_id, info=info)
             
@@ -1853,10 +1868,10 @@ class RealDebridDownloader(DownloaderBase):
                 
                 # Log what we're about to delete
                 logger.info(f"Cleaning up {len(to_delete)} torrents:")
-                for _, torrent_id, reason in to_delete:
+                for _, torrent_id, reason in to_delete[:5]:  # Log first 5 for debugging
                     logger.info(f"  • {self._format_deletion(reason)}")
                 
-                # Convert to format needed by batch delete
+                # Convert to final format
                 delete_batch = [(t[1], t[2]) for t in to_delete]
                 cleaned = self._batch_delete_torrents(delete_batch)
                 
