@@ -2042,3 +2042,16 @@ class RealDebridDownloader(DownloaderBase):
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
+
+    def _get_media_file_ids(self, torrent_info: dict) -> List[str]:
+        """Get IDs of media files from torrent info.
+        
+        Args:
+            torrent_info: Torrent information dictionary containing files
+            
+        Returns:
+            List of file IDs for media files
+        """
+        files = torrent_info.get("files", [])
+        processed = self._process_files(files)
+        return list(processed.keys()) if processed else []
