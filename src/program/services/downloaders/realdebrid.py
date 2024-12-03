@@ -540,7 +540,7 @@ class RealDebridDownloader(DownloaderBase):
         self.api = api
         self.key = "real_debrid"  # Add key attribute for API identification
         self.rate_limiter = RealDebridRateLimiter()
-        self.download_manager = DownloadManager()
+        self.download_manager = DownloadManager()  # Initialize DownloadManager
         self._lock = threading.Lock()
         self._current_attempts = []
         self.last_cleanup_time = 0
