@@ -79,7 +79,7 @@ class InvalidFileIDError(RealDebridError):
 class RealDebridRateLimiter:
     """Thread-safe rate limiter for Real-Debrid API requests."""
     
-    def __init__(self, requests_per_minute: int = 60):
+    def __init__(self, requests_per_minute: int = 90):
         self.requests_per_minute = requests_per_minute
         self.request_count = 0
         self.last_reset = time.time()
@@ -88,6 +88,8 @@ class RealDebridRateLimiter:
         self.backoff_time = 0
         self.consecutive_failures = 0
         self._start_reset_thread()
+        self._last_request_time = 0
+        self.min_request_interval = 60.0 / requests_per_minute  # Minimum time between requests
     
     def _start_reset_thread(self):
         """Start background thread to reset request counter."""
@@ -100,6 +102,11 @@ class RealDebridRateLimiter:
                         logger.debug(f"🔄 Resetting rate limit counter (was {self.request_count})")
                         self.request_count = 0
                         self.last_reset = current_time
+                        # Reset backoff if we've gone a full minute without issues
+                        if self.consecutive_failures > 0:
+                            self.consecutive_failures = max(0, self.consecutive_failures - 1)
+                            if self.consecutive_failures == 0:
+                                self.backoff_time = 0
         
         self._reset_thread = threading.Thread(target=reset_counter, daemon=True)
         self._reset_thread.start()
@@ -116,6 +123,15 @@ class RealDebridRateLimiter:
             with self._lock:
                 current_time = time.time()
                 
+                # Enforce minimum interval between requests
+                time_since_last = current_time - self._last_request_time
+                if time_since_last < self.min_request_interval:
+                    sleep_time = self.min_request_interval - time_since_last
+                    if not wait:
+                        return False
+                    time.sleep(sleep_time)
+                    continue
+                
                 # If we're in backoff period, wait
                 if self.backoff_time > current_time:
                     if not wait:
@@ -131,13 +147,11 @@ class RealDebridRateLimiter:
                     logger.debug(f"🔄 Resetting rate limit counter (was {self.request_count})")
                     self.request_count = 0
                     self.last_reset = current_time
-                    # Also reduce consecutive failures if we've gone a full minute without issues
-                    if self.consecutive_failures > 0:
-                        self.consecutive_failures = max(0, self.consecutive_failures - 1)
                 
                 # Check if we can make a request
                 if self.request_count < self.requests_per_minute:
                     self.request_count += 1
+                    self._last_request_time = current_time
                     logger.debug(f"✅ Rate limit request approved ({self.request_count}/{self.requests_per_minute})")
                     return True
                 
@@ -146,13 +160,20 @@ class RealDebridRateLimiter:
                     return False
             
             # Calculate wait time with jitter
-            jitter = random.uniform(0.5, 1.5)
+            jitter = random.uniform(0.8, 1.2)  # Reduced jitter range
             wait_time = (60 - (current_time - self.last_reset)) * jitter
-            wait_time = min(max(1, wait_time), 10)  # Bound between 1 and 10 seconds
-            
-            logger.debug(f"⏳ Rate limit reached, waiting {wait_time:.1f}s...")
+            wait_time = min(max(0.1, wait_time), 5)  # Bound between 0.1 and 5 seconds
             time.sleep(wait_time)
-
+    
+    def handle_error(self):
+        """Handle rate limit error by increasing backoff time."""
+        with self._lock:
+            self.consecutive_failures += 1
+            # Exponential backoff with max of 1 hour
+            backoff = min(60 * 60, 5 * (2 ** self.consecutive_failures))
+            self.backoff_time = time.time() + backoff
+            logger.warning(f"⚠️ Rate limit error, backing off for {backoff:.1f}s")
+    
     def mark_failure(self):
         """Mark a rate limit failure and implement exponential backoff"""
         with self._lock:
@@ -185,7 +206,7 @@ class RealDebridRateLimiter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the context manager and mark success/failure based on exception"""
         if exc_type is not None:
-            self.mark_failure()
+            self.handle_error()
         else:
             self.mark_success()
 
@@ -312,13 +333,33 @@ class RealDebridAPI:
     
     def _create_request_handler(self):
         """Create a request handler with proper headers and rate limiting."""
-        session = create_service_session(self.proxy_url)
-        session.headers.update({
-            'Authorization': f'Bearer {self.api_key}',
-            'Content-Type': 'application/x-www-form-urlencoded'
-        })
-        return RealDebridRequestHandler(session, "https://api.real-debrid.com/rest/1.0")
-    
+        session = create_service_session(
+            headers={
+                'Authorization': f'Bearer {self.api_key}'
+            },
+            proxy_url=self.proxy_url
+        )
+        
+        handler = RealDebridRequestHandler(
+            session=session,
+            base_url='https://api.real-debrid.com/rest/1.0',
+            request_logging=True
+        )
+        
+        # Wrap execute method to enforce rate limiting
+        original_execute = handler.execute
+        def rate_limited_execute(*args, **kwargs):
+            try:
+                with self.rate_limiter:
+                    return original_execute(*args, **kwargs)
+            except Exception as e:
+                if "rate limit exceeded" in str(e).lower():
+                    self.rate_limiter.handle_error()
+                raise
+        
+        handler.execute = rate_limited_execute
+        return handler
+
     def _handle_error_response(self, response: dict) -> None:
         """Handle error responses from Real-Debrid API."""
         error = response.get('error')
@@ -1019,6 +1060,18 @@ class RealDebridDownloader(DownloaderBase):
         best_seeders = -1
         
         while active_torrents:
+            current_time = datetime.now()
+            
+            # First get active torrent count
+            active_info = self.api.request_handler.execute(HttpMethod.GET, '/torrents/active')
+            active_count = len(active_info.get('torrents', []))
+            logger.debug(f"🔍 Found {active_count} active torrents")
+            
+            # Then check individual torrents
+            if active_count > 0:
+                logger.debug(f"🔍 Checking {active_count} active torrents...")
+                active_torrents = self.api.request_handler.execute(HttpMethod.GET, '/torrents')
+            
             current_time = time.time()
             
             # Check all torrents every PARALLEL_CHECK_INTERVAL seconds
@@ -1612,7 +1665,10 @@ class RealDebridDownloader(DownloaderBase):
                 reason = f"cleanup_all ({status})"
                 to_delete.append((torrent_id, reason))
                 
-            # Delete torrents in batches
+            # Convert to final format
+            to_delete = [(t[0], t[1]) for t in to_delete]
+            
+            # Process deletion in batches
             if to_delete:
                 logger.debug(f"🗑️ Deleting {len(to_delete)} torrents")
                 return self._batch_delete_torrents(to_delete)
