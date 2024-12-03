@@ -1303,8 +1303,9 @@ class RealDebridDownloader(DownloaderBase):
             
             # Add the torrent
             result = self._add_magnet_or_torrent(magnet=magnet)
-            if not result.success:
-                return result  # Already a TorrentAddResult object
+            if not result or not result.success:
+                error_msg = "Failed to add magnet" if not result else result.error
+                return TorrentAddResult(success=False, error=error_msg, torrent_id="", info={})
 
             # Get torrent info
             torrent_info = self._get_torrent_info(result.torrent_id)
@@ -1370,7 +1371,7 @@ class RealDebridDownloader(DownloaderBase):
                     cleaned = self._cleanup_all_except(set())
                     if cleaned == 0:
                         logger.error("❌ Could not free up torrent slots")
-                        return None
+                        return TorrentAddResult(success=False, error="Could not free up torrent slots", torrent_id="", info={})
                         
             # Add the magnet with rate limiting
             with self.rate_limiter:
@@ -1387,6 +1388,7 @@ class RealDebridDownloader(DownloaderBase):
                     return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
                 else:
                     logger.error("❌ Empty response from Real-Debrid API")
+                    return TorrentAddResult(success=False, error="Empty response from Real-Debrid API", torrent_id="", info={})
                     
         except Exception as e:
             backoff = min(base_backoff * (2 ** (attempt - 1)), 30)  # Cap at 30 seconds
@@ -1404,8 +1406,9 @@ class RealDebridDownloader(DownloaderBase):
                 return self._add_magnet_or_torrent(magnet=magnet, torrent=torrent, attempt=attempt + 1)
             else:
                 logger.error(f"❌ Failed to add torrent after {max_attempts} attempts: {e}")
-                
-        return None
+                return TorrentAddResult(success=False, error=f"Failed to add torrent after {max_attempts} attempts: {e}", torrent_id="", info={})
+        
+        return TorrentAddResult(success=False, error="Unknown error", torrent_id="", info={})
 
     def _calculate_timeout(self, info: dict, item: MediaItem) -> float:
         """Calculate download timeout based on file size and progress"""
@@ -2229,7 +2232,7 @@ class RealDebridDownloader(DownloaderBase):
         # Check if content is already complete
         if self._is_content_complete(content_id):
             logger.debug(f"Content {content_id} already complete")
-            return True
+            return DownloadCachedStreamResult(success=True, error=None, torrent_id="", info={})
         
         # Get alternative streams to try if the main one fails
         alternative_streams = self._get_alternative_streams(item, stream)
@@ -2243,18 +2246,18 @@ class RealDebridDownloader(DownloaderBase):
             # Check if we can start a new download
             if not self._can_start_download(content_id):
                 logger.warning(f"Too many active downloads for {content_id}")
-                return False
+                return DownloadCachedStreamResult(success=False, error=f"Too many active downloads for {content_id}")
                 
             try:
                 # Try to add and process the torrent
                 if self._try_download_stream(current_stream, item):
-                    return True
+                    return DownloadCachedStreamResult(success=True, error=None, torrent_id="", info={})
                     
             except Exception as e:
                 logger.error(f"Error downloading stream {current_stream.id}: {e}")
                 continue
                 
-        return False
+        return DownloadCachedStreamResult(success=False, error="No torrents downloaded successfully")
 
     def _try_download_stream(self, stream: Stream, item: MediaItem) -> bool:
         """Try to download a stream"""
@@ -2277,7 +2280,7 @@ class RealDebridDownloader(DownloaderBase):
         # Download the torrent
         return self.wait_for_download(result.torrent_id, item.id, item, stream)
 
-    def _add_magnet_or_torrent(self, magnet: Optional[str] = None, torrent: Optional[bytes] = None, attempt: int = 1) -> Optional[str]:
+    def _add_magnet_or_torrent(self, magnet: Optional[str] = None, torrent: Optional[bytes] = None, attempt: int = 1) -> TorrentAddResult:
         """Add a magnet or torrent to Real-Debrid with rate limit handling."""
         max_attempts = 5
         base_backoff = 2  # Base delay in seconds
@@ -2294,7 +2297,7 @@ class RealDebridDownloader(DownloaderBase):
                     cleaned = self._cleanup_all_except(set())
                     if cleaned == 0:
                         logger.error("❌ Could not free up torrent slots")
-                        return None
+                        return TorrentAddResult(success=False, error="Could not free up torrent slots", torrent_id="", info={})
                         
             # Add the magnet with rate limiting
             with self.rate_limiter:
@@ -2308,7 +2311,10 @@ class RealDebridDownloader(DownloaderBase):
                 torrent_id = response.get("id")
                 if torrent_id:
                     logger.debug(f"✅ Successfully added torrent {torrent_id}")
-                    return torrent_id
+                    return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
+                else:
+                    logger.error("❌ Empty response from Real-Debrid API")
+                    return TorrentAddResult(success=False, error="Empty response from Real-Debrid API", torrent_id="", info={})
                     
         except Exception as e:
             backoff = min(base_backoff * (2 ** (attempt - 1)), 30)  # Cap at 30 seconds
@@ -2326,5 +2332,4 @@ class RealDebridDownloader(DownloaderBase):
                 return self._add_magnet_or_torrent(magnet=magnet, torrent=torrent, attempt=attempt + 1)
             else:
                 logger.error(f"❌ Failed to add torrent after {max_attempts} attempts: {e}")
-                
-        return None
+                return TorrentAddResult(success=False, error=f"Failed to add torrent after {max_attempts} attempts: {e}", torrent_id="", info={})
