@@ -328,7 +328,7 @@ class RealDebridAPI:
     # API endpoints
     ENDPOINTS = {
         'torrents': 'torrents',
-        'torrents_active': 'torrents/active',
+        'torrents_active': 'torrents/activeCount',  # Fixed: use activeCount endpoint
         'torrents_info': 'torrents/info',
         'torrents_completed': 'torrents/completed',
         'unrestrict': 'unrestrict/link'
@@ -1015,23 +1015,31 @@ class RealDebridDownloader(DownloaderBase):
     def download_cached_stream(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
         """Download a stream from Real-Debrid with sequential parallel checking"""
         try:
-            # Use cached active torrents if available (cache for 30 seconds)
-            current_time = int(time.time())
-            if (hasattr(self, '_active_torrents_cache') and 
-                current_time - self._active_torrents_last_check < 30):
-                active_torrents = self._active_torrents_cache
-                logger.debug(f"Using cached active torrents list ({len(active_torrents)})")
-            else:
-                # Get active torrents with a single request
-                active_info = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_active'])
-                active_torrents = active_info.get('torrents', [])
-                # Update cache
-                self._active_torrents_cache = active_torrents
-                self._active_torrents_last_check = current_time
+            # First check active count
+            active_info = self.api.request_handler.execute(
+                HttpMethod.GET, 
+                self.ENDPOINTS['torrents_active']
+            )
             
-            active_count = len(active_torrents)
+            active_count = active_info.get('count', 0)
             if active_count > 0:
                 logger.debug(f"🔍 Found {active_count} active torrents")
+                
+                # Then get full torrent list only if we have active torrents
+                torrents = self.api.request_handler.execute(
+                    HttpMethod.GET,
+                    self.ENDPOINTS['torrents']
+                )
+                
+                if not isinstance(torrents, list):
+                    logger.error(f"Unexpected torrents response type: {type(torrents)}")
+                    return DownloadCachedStreamResult(success=False, error="Invalid API response format")
+                
+                # Filter active torrents
+                active_torrents = [
+                    t['id'] for t in torrents 
+                    if t.get('status') in ['downloading', 'magnet_conversion', 'waiting_files_selection']
+                ]
                 
                 # Process torrents in smaller batches with rate limiting
                 batch_size = 2  # Reduced batch size
@@ -1052,6 +1060,8 @@ class RealDebridDownloader(DownloaderBase):
                     # Add larger delay between batches
                     if i + batch_size < len(active_torrents):
                         time.sleep(2)  # Increased delay between batches
+            else:
+                logger.debug("No active torrents found")
             
             return self._finalize_download(item, stream)
             
