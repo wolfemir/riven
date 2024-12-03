@@ -177,6 +177,18 @@ class RealDebridRateLimiter:
         if self._reset_thread:
             self._reset_thread.join(timeout=1)
 
+    def __enter__(self):
+        """Enter the context manager by acquiring a rate limit slot"""
+        self.acquire()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit the context manager and mark success/failure based on exception"""
+        if exc_type is not None:
+            self.mark_failure()
+        else:
+            self.mark_success()
+
 class DownloadManager:
     """Manages concurrent downloads and threads"""
     def __init__(self, max_concurrent: int = 5):
@@ -2030,10 +2042,10 @@ class RealDebridDownloader(DownloaderBase):
                 # Could mean: already deleted, invalid ID, or never existed
                 logger.warning(f"Could not delete torrent {torrent_id}: Unknown resource (404)")
                 return
-            elif "401" in error_str:
+            elif "401" in str(e):
                 logger.error("API token expired or invalid")
                 raise
-            elif "403" in error_str:
+            elif "403" in str(e):
                 logger.error("Account locked or permission denied")
                 raise
             else:
