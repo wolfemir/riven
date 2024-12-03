@@ -370,16 +370,31 @@ class RealDebridDownloader(DownloaderBase):
     MAX_CONCURRENT_PER_CONTENT = 4  # Increased from 2 to 4
     MAX_CONCURRENT_CONTENT = 5  # Maximum number of different content items downloading at once
     STATUS_CHECK_INTERVAL = 5  # seconds
-    QUEUE_TIMEOUT = 30  # seconds
-    MAX_ZERO_SEEDER_CHECKS = 2  # Maximum number of zero seeder checks
-    MAX_PARALLEL_TORRENTS = 5  # Maximum number of parallel torrents to try
-    INITIAL_CHECK_DELAY = 5  # Initial delay before checking each torrent status
-    TORRENT_ADD_INTERVAL = 5  # Wait time between adding torrents
-    PARALLEL_CHECK_INTERVAL = 15  # Check interval for all active torrents
+    QUEUE_TIMEOUT = 60  # Increased from 30 to allow more time in queue
+    MAX_ZERO_SEEDER_CHECKS = 3  # Increased from 2 to give more time for seeders
+    MAX_PARALLEL_TORRENTS = 5
+    INITIAL_CHECK_DELAY = 5
+    TORRENT_ADD_INTERVAL = 5
+    PARALLEL_CHECK_INTERVAL = 15
     RATE_LIMIT_BACKOFF_BASE = 2.0  # Base for exponential backoff
     RATE_LIMIT_INITIAL_DELAY = 5.0  # Initial delay in seconds
     RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay in seconds
     RATE_LIMIT_MAX_RETRIES = 5  # Maximum number of retries for rate limited requests
+
+    # Constants for seeder checking
+    SEEDER_CHECK_INTERVAL = 5  # Check every 5 seconds
+    MAX_SEEDER_CHECKS = 4      # Check 4 times (0s, 5s, 10s, 15s = total 20s)
+    INITIAL_CHECK_DELAY = 5    # Wait 5s before first check
+
+    # Constants for cleanup thresholds
+    CLEANUP_NO_SEEDERS_TIME = 120  # Time to wait before cleaning up torrents with 0 seeders (2 minutes)
+    CLEANUP_SLOW_SPEED_TIME = 300  # Time to wait before cleaning up slow torrents (5 minutes)
+    CLEANUP_NO_PROGRESS_TIME = 300  # Time to wait before cleaning up torrents with no progress (5 minutes)
+    CLEANUP_MAGNET_TIME = 300  # Time to wait before cleaning up stuck magnet conversions (5 minutes)
+    CLEANUP_FILE_SELECTION_TIME = 120  # Time to wait before cleaning up stuck file selections (2 minutes)
+    CLEANUP_SPEED_THRESHOLD = 50000  # Minimum acceptable speed in bytes/s (50 KB/s)
+    CLEANUP_PROGRESS_CHECK_INTERVAL = 60  # How often to check progress (1 minute)
+    CLEANUP_BATCH_SIZE = 10  # Maximum number of torrents to delete in one batch
 
     def __init__(self, api: RealDebridAPI):
         """Initialize Real-Debrid downloader with thread-safe components"""
@@ -1105,8 +1120,13 @@ class RealDebridDownloader(DownloaderBase):
         """Wait for torrent to finish downloading"""
         start_time = time.time()
         last_check_time = time.time()
-        zero_seeder_count = 0  # Track consecutive zero seeder checks
-        queue_start_time = None  # Track when queue started
+        seeder_check_count = 0
+        queue_start_time = None
+        last_progress = 0
+        stall_start_time = None
+        
+        # Wait initial delay before first check
+        time.sleep(self.INITIAL_CHECK_DELAY)
         
         while True:
             current_time = time.time()
@@ -1122,14 +1142,28 @@ class RealDebridDownloader(DownloaderBase):
                 if not info:
                     return DownloadCachedStreamResult(success=False, error="Failed to get torrent info")
 
-                status = info.get("status", "").lower()  # Convert to lowercase
+                status = info.get("status", "").lower()
                 filename = info.get("filename", "unknown")
                 progress = info.get("progress", 0)
                 speed = info.get("speed", 0) / 1024 / 1024  # Convert to MB/s
                 seeders = info.get("seeders", 0)
 
-                logger.debug(f"📊 {self._format_progress(progress, speed, seeders)}\n"
-                             f"🎬 Processing file: {filename}")
+                # Log status with content name
+                logger.debug(f"📊 {self._format_progress(progress, speed, seeders, item)}\n"
+                           f"🎬 File: {filename}\n"
+                           f"⏱️ Elapsed: {elapsed:.1f}s")
+
+                # Check seeders
+                should_continue, error = self._check_seeders(info, elapsed, seeder_check_count)
+                if not should_continue:
+                    return DownloadCachedStreamResult(success=False, error=error)
+                    
+                seeder_check_count += 1
+                
+                # Manage multiple torrents of same content
+                should_continue, error = self._manage_content_torrents(content_id, torrent_id)
+                if not should_continue:
+                    return DownloadCachedStreamResult(success=False, error=error)
 
                 # For any status, first check if we have valid files
                 files = info.get("files", [])
@@ -1160,29 +1194,36 @@ class RealDebridDownloader(DownloaderBase):
                     
                     queue_time = current_time - queue_start_time
                     if queue_time > self.QUEUE_TIMEOUT:
-                        return DownloadCachedStreamResult(success=False, error=f"Queue timeout after {queue_time:.1f}s")
+                        return DownloadCachedStreamResult(
+                            success=False, 
+                            error=f"Queue timeout after {queue_time:.1f}s"
+                        )
                     
                     last_check_time = current_time
                     continue
 
                 elif status == RDTorrentStatus.DOWNLOADING.value:
                     if progress is not None:
-                        logger.debug(f"⬇️ {filename}")
-                        logger.debug(f"📊 {self._format_progress(progress, speed, seeders)}")
+                        # Check for stalled download
+                        if progress == last_progress and speed == 0:
+                            if stall_start_time is None:
+                                stall_start_time = current_time
+                            elif current_time - stall_start_time > self.BASE_TIMEOUT:
+                                return DownloadCachedStreamResult(
+                                    success=False, 
+                                    error=f"Download stalled at {progress:.1f}% for {(current_time - stall_start_time):.1f}s"
+                                )
+                        else:
+                            stall_start_time = None
+                            last_progress = progress
                         
                         # Calculate timeout based on progress and file size
                         timeout = self._calculate_timeout(info, item)
                         if elapsed > timeout:
-                            return DownloadCachedStreamResult(success=False, error=f"Download timeout after {elapsed:.1f}s")
-                        
-                        # Check for stalled download
-                        if speed == 0:
-                            if seeders == 0:
-                                zero_seeder_count += 1
-                                if zero_seeder_count >= self.MAX_ZERO_SEEDER_CHECKS:
-                                    return DownloadCachedStreamResult(success=False, error="No seeders available")
-                            else:
-                                zero_seeder_count = 0  # Reset counter if we find seeders
+                            return DownloadCachedStreamResult(
+                                success=False, 
+                                error=f"Download timeout after {elapsed:.1f}s"
+                            )
                     
                     last_check_time = current_time
                     continue
@@ -1205,21 +1246,14 @@ class RealDebridDownloader(DownloaderBase):
                     )
 
                 elif status in (RDTorrentStatus.ERROR.value, RDTorrentStatus.MAGNET_ERROR.value, RDTorrentStatus.DEAD.value):
-                    return DownloadCachedStreamResult(
-                        success=False,
-                        error=f"❌ Download failed with status: {status}"
-                    )
-
-                else:
-                    logger.warning(f"⚠️ Unhandled status: {status}")
-                    last_check_time = current_time
-                    continue
+                    error_msg = info.get("error", "Unknown error")
+                    return DownloadCachedStreamResult(success=False, error=f"Torrent error: {error_msg}")
 
             except Exception as e:
-                logger.error(f"❌ Error checking download status: {str(e)}")
-                return DownloadCachedStreamResult(success=False, error=f"Error checking status: {str(e)}")
+                logger.error(f"Error checking download status: {e}")
+                return DownloadCachedStreamResult(success=False, error=str(e))
 
-            time.sleep(self.STATUS_CHECK_INTERVAL)
+            last_check_time = current_time
 
     def _add_active_download(self, content_id: str, torrent_id: str):
         """Add a download to active downloads tracking."""
@@ -1494,17 +1528,45 @@ class RealDebridDownloader(DownloaderBase):
         }
         return self._color_text(status, color_map.get(status.lower(), 'white'))
 
-    def _format_progress(self, progress: float, speed: float, seeders: int) -> str:
+    def _format_progress(self, progress: float, speed: float, seeders: int, item: Optional[MediaItem] = None) -> str:
         """Format progress info with colors"""
-        progress_color = 'green' if progress >= 90 else 'yellow' if progress >= 50 else 'blue'
-        speed_color = 'green' if speed > 5 else 'yellow' if speed > 1 else 'blue'
-        seeders_color = 'green' if seeders > 10 else 'yellow' if seeders > 0 else 'red'
-        
-        return (
-            f"Progress: {self._color_text(f'{progress:.1f}%', progress_color)}, "
-            f"Speed: {self._color_text(f'{speed:.2f}MB/s', speed_color)}, "
-            f"Seeders: {self._color_text(str(seeders), seeders_color)}"
-        )
+        # Format progress percentage
+        progress_str = f"{progress:.1f}%" if progress is not None else "?.?%"
+        if progress == 0:
+            progress_str = self._color_text(progress_str, "red")
+        elif progress < 50:
+            progress_str = self._color_text(progress_str, "yellow")
+        else:
+            progress_str = self._color_text(progress_str, "green")
+            
+        # Format speed
+        speed_str = f"{speed:.1f}MB/s" if speed > 1 else f"{speed*1024:.1f}KB/s" if speed > 0 else "0KB/s"
+        if speed == 0:
+            speed_str = self._color_text(speed_str, "red")
+        elif speed < 1:  # Less than 1 MB/s
+            speed_str = self._color_text(speed_str, "yellow")
+        else:
+            speed_str = self._color_text(speed_str, "green")
+            
+        # Format seeders
+        seeders_str = str(seeders)
+        if seeders == 0:
+            seeders_str = self._color_text(seeders_str, "red")
+        elif seeders < 5:
+            seeders_str = self._color_text(seeders_str, "yellow")
+        else:
+            seeders_str = self._color_text(seeders_str, "green")
+
+        # Format content name if available
+        content_str = ""
+        if item:
+            if hasattr(item, 'name') and callable(item.name):
+                name = item.name()
+            else:
+                name = getattr(item, 'title', 'Unknown')
+            content_str = f" [{self._color_text(name, 'cyan')}]"
+            
+        return f"{progress_str} 🌱{seeders_str} ⚡{speed_str}{content_str}"
 
     def _format_count(self, current: int, limit: int) -> str:
         """Format count with color based on how close to limit"""
@@ -1539,7 +1601,7 @@ class RealDebridDownloader(DownloaderBase):
             # Build list of torrents to delete
             to_delete = []
             for torrent in torrents:
-                torrent_id = torrent.get("id")
+                torrent_id = torrent.get("id", "")
                 if not torrent_id or torrent_id in exclude_ids:
                     continue
                     
@@ -1728,7 +1790,7 @@ class RealDebridDownloader(DownloaderBase):
             
             logger.debug(
                 f"📊 {self._format_progress(progress, speed_mb, seeders)}\n"
-                f"🎬 Status: {self._format_status(status)}"
+                f"🎬 Processing file: {filename}"
             )
             
             # Log file details if available
@@ -1804,54 +1866,52 @@ class RealDebridDownloader(DownloaderBase):
         """Clean up inactive, errored, or stalled torrents to free up slots.
         Returns number of torrents cleaned up."""
         current_time = time.time()
-        if (current_time - self.last_cleanup_time) < 60:  # Reduce interval to 1 minute
+        if (current_time - self.last_cleanup_time) < self.CLEANUP_PROGRESS_CHECK_INTERVAL:
             return 0
             
         try:
             # Get active torrent count
             try:
                 active_count = self.api.request_handler.execute(HttpMethod.GET, "torrents/activeCount")
-                logger.debug(f"⚠️ At active torrent limit {self._format_count(active_count['nb'], active_count['limit'])}")
-                if active_count["nb"] < active_count["limit"]:
-                    return 0
+                logger.debug(f"Active torrents: {self._format_count(active_count['nb'], active_count['limit'])}")
                 
-                # Calculate how aggressive we should be based on how far over the limit we are
+                # Calculate cleanup aggressiveness based on how far over limit we are
                 overage = active_count["nb"] - active_count["limit"]
-                logger.warning(f"Over active torrent limit by {overage} torrents")
-                # If we're over by more than 5, be extremely aggressive
                 extremely_aggressive = overage >= 5
-                # If we're over by any amount, be somewhat aggressive
                 aggressive_cleanup = overage > 0
+                
+                if overage > 0:
+                    logger.warning(f"⚠️ Over active torrent limit by {overage} torrents")
+                elif active_count["nb"] < active_count["limit"]:
+                    logger.debug("✅ Under active torrent limit")
+                    return 0
             except Exception as e:
                 logger.warning(f"Failed to get active torrent count: {e}")
-                extremely_aggressive = True  # Be extremely aggressive if we can't check
+                extremely_aggressive = True
                 aggressive_cleanup = True
             
             # Get list of all torrents
             torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
             to_delete = []  # List of (priority, torrent_id, reason) tuples
-            cleaned = 0
             
-            # Count active torrents by status and collect stats
-            active_by_status = defaultdict(list)
-            magnet_times = []  # Track magnet conversion times
-            downloading_stats = []  # Track download stats
+            # Track torrents by various attributes
+            filename_to_torrents = defaultdict(list)  # Track potential duplicates
+            status_counts = defaultdict(int)  # Count torrents by status
             total_active = 0
-            
-            # Track duplicates by filename
-            filename_to_torrents = defaultdict(list)
             
             for torrent in torrents:
                 status = torrent.get("status", "")
                 if not self._is_active_status(status):
                     continue
                     
+                total_active += 1
+                status_counts[status] += 1
+                
                 # Calculate elapsed time
                 time_elapsed = 0
                 try:
                     added = torrent.get("added", "")
                     if added:
-                        # Convert to UTC, then to local time
                         added_time = datetime.fromisoformat(added.replace("Z", "+00:00"))
                         added_time = added_time.astimezone().replace(tzinfo=None)
                         time_elapsed = (datetime.now() - added_time).total_seconds()
@@ -1865,62 +1925,219 @@ class RealDebridDownloader(DownloaderBase):
                     "speed": torrent.get("speed", 0),
                     "seeders": torrent.get("seeders", 0),
                     "time_elapsed": time_elapsed,
-                    "id": torrent.get("id", "")
+                    "id": torrent.get("id", ""),
+                    "size": torrent.get("bytes", 0)
                 }
                 
                 # Track potential duplicates
                 filename_to_torrents[torrent_stats["filename"]].append(torrent_stats)
                 
-                # Check for stalled downloads - More aggressive thresholds
+                # Priority-based cleanup checks
+                cleanup_priority = None
+                cleanup_reason = None
+                
                 if status == "downloading":
-                    # No seeders and no progress for 2 minutes
+                    # 1. Highest Priority: No seeders and no progress
                     if torrent_stats["speed"] == 0 and torrent_stats["seeders"] == 0:
-                        if time_elapsed > 120:  # Reduced from 300s to 120s
-                            reason = f"stalled with no seeders (file: {torrent_stats['filename']}, progress: {torrent_stats['progress']}%)"
-                            to_delete.append((90, torrent_stats["id"], reason))
-                    # Extremely slow downloads
+                        if time_elapsed > self.CLEANUP_NO_SEEDERS_TIME:
+                            cleanup_priority = 90
+                            cleanup_reason = (f"stalled with no seeders for {time_elapsed:.0f}s "
+                                           f"(progress: {torrent_stats['progress']:.1f}%)")
+                    
+                    # 2. High Priority: No progress at all
+                    elif torrent_stats["progress"] == 0:
+                        if time_elapsed > self.CLEANUP_NO_PROGRESS_TIME:
+                            cleanup_priority = 85
+                            cleanup_reason = f"no progress in {time_elapsed:.0f}s"
+                    
+                    # 3. Medium Priority: Extremely slow download
                     elif torrent_stats["speed"] < self.CLEANUP_SPEED_THRESHOLD:
-                        if time_elapsed > 300:  # Reduced from 900s to 300s
+                        if time_elapsed > self.CLEANUP_SLOW_SPEED_TIME:
                             speed_kb = torrent_stats["speed"] / 1024
-                            reason = f"extremely slow ({speed_kb:.1f} KB/s) (file: {torrent_stats['filename']}, progress: {torrent_stats['progress']}%)"
-                            to_delete.append((80, torrent_stats["id"], reason))
-                    # No progress in 5 minutes
-                    elif torrent_stats["progress"] == 0 and time_elapsed > 300:
-                        reason = f"no progress in 5 minutes (file: {torrent_stats['filename']})"
-                        to_delete.append((85, torrent_stats["id"], reason))
+                            cleanup_priority = 80
+                            cleanup_reason = (f"slow speed ({speed_kb:.1f} KB/s) for {time_elapsed:.0f}s "
+                                           f"(progress: {torrent_stats['progress']:.1f}%)")
                 
-                # Check for stuck magnet conversions
-                elif status == "magnet_conversion" and time_elapsed > 300:  # Reduced from 600s to 300s
-                    reason = f"stuck in magnet conversion for {time_elapsed:.0f}s"
-                    to_delete.append((70, torrent_stats["id"], reason))
+                # 4. Medium Priority: Stuck in magnet conversion
+                elif status == "magnet_conversion":
+                    if time_elapsed > self.CLEANUP_MAGNET_TIME:
+                        cleanup_priority = 70
+                        cleanup_reason = f"stuck in magnet conversion for {time_elapsed:.0f}s"
                 
-                # Check for stuck waiting for selection
-                elif status == "waiting_files_selection" and time_elapsed > 120:  # New check
-                    reason = f"stuck waiting for file selection for {time_elapsed:.0f}s"
-                    to_delete.append((75, torrent_stats["id"], reason))
-        
-            # Handle duplicates - only if we're being aggressive
+                # 5. Medium Priority: Stuck waiting for file selection
+                elif status == "waiting_files_selection":
+                    if time_elapsed > self.CLEANUP_FILE_SELECTION_TIME:
+                        cleanup_priority = 75
+                        cleanup_reason = f"stuck waiting for file selection for {time_elapsed:.0f}s"
+                
+                if cleanup_priority and cleanup_reason:
+                    # Add file details to reason
+                    size_str = self._format_size(torrent_stats["size"])
+                    full_reason = f"{cleanup_reason} (file: {torrent_stats['filename']}, size: {size_str})"
+                    to_delete.append((cleanup_priority, torrent_stats["id"], full_reason))
+            
+            # Log status summary
+            if status_counts:
+                status_summary = [f"{status}: {count}" for status, count in status_counts.items()]
+                logger.debug(f"Active torrent status: {', '.join(status_summary)}")
+            
+            # Handle duplicates only if we're being aggressive
             if aggressive_cleanup:
                 for filename, dupes in filename_to_torrents.items():
                     if len(dupes) > 1:
-                        # Sort by progress (highest first), then by speed, then by seeders
+                        # Sort by progress (highest first), then speed, then seeders
                         dupes.sort(key=lambda x: (x["progress"], x["speed"], x["seeders"]), reverse=True)
                         best = dupes[0]
                         
                         # Delete all duplicates except the best one
                         for dupe in dupes[1:]:
-                            reason = f"duplicate of {best['filename']} ({best['progress']}% vs {dupe['progress']}%)"
+                            reason = (f"duplicate of {best['filename']} "
+                                    f"(this: {dupe['progress']:.1f}% @ {dupe['speed']/1024:.1f}KB/s, "
+                                    f"best: {best['progress']:.1f}% @ {best['speed']/1024:.1f}KB/s)")
                             to_delete.append((60, dupe["id"], reason))
             
-            # Sort by priority (highest first) and delete
+            # Sort by priority (highest first) and limit batch size
             if to_delete:
                 to_delete.sort(reverse=True)
-                delete_batch = [(t[1], t[2]) for t in to_delete]  # Convert to (id, reason) tuples
+                to_delete = to_delete[:self.CLEANUP_BATCH_SIZE]
+                
+                # Log what we're about to delete
+                logger.info(f"Cleaning up {len(to_delete)} torrents:")
+                for _, torrent_id, reason in to_delete:
+                    logger.info(f"  • {self._format_deletion(reason)}")
+                
+                # Convert to format needed by batch delete
+                delete_batch = [(t[1], t[2]) for t in to_delete]
                 cleaned = self._batch_delete_torrents(delete_batch)
                 
-            self.last_cleanup_time = current_time
-            return cleaned
+                if cleaned:
+                    logger.info(f"✅ Successfully cleaned up {cleaned} torrents")
+                else:
+                    logger.warning("⚠️ Failed to clean up any torrents")
+                
+                self.last_cleanup_time = current_time
+                return cleaned
+            
+            return 0
             
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
+
+    def _check_seeders(self, info: dict, elapsed: float, seeder_check_count: int) -> Tuple[bool, str]:
+        """
+        Check if torrent has seeders within the configured check pattern.
+        
+        Args:
+            info: Torrent info dictionary
+            elapsed: Time elapsed since start
+            seeder_check_count: Number of seeder checks performed
+            
+        Returns:
+            Tuple of (should_continue, error_message)
+            - should_continue: True if download should continue, False if it should stop
+            - error_message: Error message if should_continue is False, empty string otherwise
+        """
+        seeders = info.get("seeders", 0)
+        
+        # Only check seeders during initial period
+        if elapsed <= (self.SEEDER_CHECK_INTERVAL * self.MAX_SEEDER_CHECKS):
+            if seeders == 0:
+                if seeder_check_count >= self.MAX_SEEDER_CHECKS:
+                    error = f"No seeders found after {seeder_check_count} checks ({elapsed:.1f}s)"
+                    logger.warning(error)
+                    return False, error
+                return True, ""
+            else:
+                # Found seeders, log and continue
+                logger.info(f"Found {seeders} seeders after {seeder_check_count} checks")
+                return True, ""
+                
+        return True, ""
+
+    def _manage_content_torrents(self, content_id: str, current_torrent_id: str) -> Tuple[bool, str]:
+        """
+        Manage multiple torrents of the same content.
+        After 4 torrents of same content, keep only the one with highest seeders.
+        
+        Args:
+            content_id: ID of the content being downloaded
+            current_torrent_id: ID of the current torrent being checked
+            
+        Returns:
+            Tuple of (should_continue, error_message)
+            - should_continue: True if current torrent should continue, False if it should stop
+            - error_message: Error message if should_continue is False, empty string otherwise
+        """
+        active_torrents = self.active_downloads[content_id]
+        if len(active_torrents) < 4:
+            return True, ""
+            
+        # Get seeder info for all active torrents
+        torrent_seeders = {}
+        for torrent_id in active_torrents:
+            info = self.get_torrent_info(torrent_id)
+            if info:
+                torrent_seeders[torrent_id] = info.get("seeders", 0)
+            else:
+                torrent_seeders[torrent_id] = 0
+                
+        # If all have 0 seeders, remove all and move to next content
+        if all(seeders == 0 for seeders in torrent_seeders.values()):
+            for torrent_id in active_torrents.copy():
+                self.delete_torrent(torrent_id)
+                self._remove_active_download(content_id, torrent_id)
+            return False, "All torrents have 0 seeders, moving to next content"
+            
+        # Keep only the torrent with highest seeders
+        best_torrent = max(torrent_seeders.items(), key=lambda x: x[1])[0]
+        
+        # If current torrent is not the best one, remove it
+        if current_torrent_id != best_torrent:
+            self.delete_torrent(current_torrent_id)
+            self._remove_active_download(content_id, current_torrent_id)
+            return False, f"Removed in favor of torrent with higher seeders ({torrent_seeders[best_torrent]} seeders)"
+            
+        # Remove all other torrents
+        for torrent_id in active_torrents.copy():
+            if torrent_id != best_torrent:
+                self.delete_torrent(torrent_id)
+                self._remove_active_download(content_id, torrent_id)
+                
+        return True, ""
+
+    def _get_media_file_ids(self, info: dict) -> List[str]:
+        """
+        !!! CRITICAL METHOD - DO NOT REMOVE !!!
+        This method is essential for the torrent file selection process.
+        It is used by add_torrent() to identify which files to download.
+        
+        Get the file IDs of media files from torrent info.
+        
+        Args:
+            info (dict): Torrent info dictionary from Real-Debrid API containing:
+                - files (List[dict]): List of file info dictionaries with:
+                    - path (str): File path/name
+                    - id (str/int): File ID
+                
+        Returns:
+            List[str]: List of file IDs for media files that match VIDEO_EXTENSIONS
+            
+        Example:
+            >>> info = {"files": [{"path": "movie.mkv", "id": "1"}, {"path": "sample.txt", "id": "2"}]}
+            >>> self._get_media_file_ids(info)
+            ["1"]
+        """
+        files = info.get("files", [])
+        if not files:
+            return []
+            
+        media_files = []
+        for file in files:
+            filename = file.get("path", "").lower()
+            if any(filename.endswith(ext) for ext in VIDEO_EXTENSIONS):
+                file_id = str(file.get("id"))
+                if file_id:
+                    media_files.append(file_id)
+                    
+        return media_files
