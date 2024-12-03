@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union, Any
 from collections import defaultdict
 from datetime import timedelta
 import random
+from requests import Response
 
 from loguru import logger
 from pydantic import BaseModel
@@ -161,6 +162,9 @@ class RealDebridAPI:
         'unrestrict_container_link': '/unrestrict/containerLink'  # POST - Decrypt container from link
     }
     
+    BATCH_SIZE = 10  # Number of items to process in a batch
+    BATCH_DELAY = 2  # Delay between batches in seconds
+    
     def __init__(self, api_key: str, proxy_url: Optional[str] = None):
         self.api_key = api_key
         self.proxy_url = proxy_url
@@ -279,6 +283,183 @@ class RealDebridAPI:
             data={'link': link}
         )
 
+    def get_torrents_batch(self, torrent_ids: List[str]) -> List[Optional[Dict]]:
+        """Get info for multiple torrents in an efficient manner.
+        
+        Args:
+            torrent_ids: List of torrent IDs to fetch info for
+            
+        Returns:
+            List of torrent info dictionaries, None for torrents that weren't found
+        """
+        results = []
+        for i in range(0, len(torrent_ids), self.BATCH_SIZE):
+            batch = torrent_ids[i:i + self.BATCH_SIZE]
+            batch_results = []
+            
+            for torrent_id in batch:
+                try:
+                    info = self.request_handler.execute(
+                        HttpMethod.GET,
+                        f"{self.ENDPOINTS['torrent_info']}/{torrent_id}"
+                    )
+                    batch_results.append(info)
+                except Exception as e:
+                    if "404" in str(e):
+                        batch_results.append(None)
+                    else:
+                        raise
+                
+            results.extend(batch_results)
+            
+            # Add delay between batches if not the last batch
+            if i + self.BATCH_SIZE < len(torrent_ids):
+                time.sleep(self.BATCH_DELAY)
+                
+        return results
+
+    def delete_downloads_batch(self, download_ids: List[str]) -> List[bool]:
+        """Delete multiple downloads in batches.
+        
+        Args:
+            download_ids: List of download IDs to delete
+            
+        Returns:
+            List of booleans indicating success/failure for each download
+        """
+        results = []
+        for i in range(0, len(download_ids), self.BATCH_SIZE):
+            batch = download_ids[i:i + self.BATCH_SIZE]
+            batch_results = []
+            
+            for download_id in batch:
+                try:
+                    self.request_handler.execute(
+                        HttpMethod.DELETE,
+                        f"{self.ENDPOINTS['download_delete']}/{download_id}"
+                    )
+                    batch_results.append(True)
+                except Exception as e:
+                    if "404" in str(e):
+                        batch_results.append(True)  # Count as success if already deleted
+                    else:
+                        batch_results.append(False)
+                        logger.warning(f"Failed to delete download {download_id}: {e}")
+                
+            results.extend(batch_results)
+            
+            # Add delay between batches if not the last batch
+            if i + self.BATCH_SIZE < len(download_ids):
+                time.sleep(self.BATCH_DELAY)
+                
+        return results
+
+    def delete_torrents_batch(self, torrent_ids: List[str]) -> List[bool]:
+        """Delete multiple torrents in batches.
+        
+        Args:
+            torrent_ids: List of torrent IDs to delete
+            
+        Returns:
+            List of booleans indicating success/failure for each torrent
+        """
+        results = []
+        for i in range(0, len(torrent_ids), self.BATCH_SIZE):
+            batch = torrent_ids[i:i + self.BATCH_SIZE]
+            batch_results = []
+            
+            for torrent_id in batch:
+                try:
+                    self.request_handler.execute(
+                        HttpMethod.DELETE,
+                        f"{self.ENDPOINTS['torrent_delete']}/{torrent_id}"
+                    )
+                    batch_results.append(True)
+                except Exception as e:
+                    if "404" in str(e):
+                        batch_results.append(True)  # Count as success if already deleted
+                    else:
+                        batch_results.append(False)
+                        logger.warning(f"Failed to delete torrent {torrent_id}: {e}")
+                
+            results.extend(batch_results)
+            
+            # Add delay between batches if not the last batch
+            if i + self.BATCH_SIZE < len(torrent_ids):
+                time.sleep(self.BATCH_DELAY)
+                
+        return results
+
+    def unrestrict_links_batch(self, links: List[str]) -> List[Optional[Dict]]:
+        """Unrestrict multiple links in batches.
+        
+        Args:
+            links: List of links to unrestrict
+            
+        Returns:
+            List of unrestricted link info dictionaries, None for failed links
+        """
+        results = []
+        for i in range(0, len(links), self.BATCH_SIZE):
+            batch = links[i:i + self.BATCH_SIZE]
+            batch_results = []
+            
+            for link in batch:
+                try:
+                    info = self.request_handler.execute(
+                        HttpMethod.POST,
+                        self.ENDPOINTS['unrestrict_link'],
+                        data={'link': link}
+                    )
+                    batch_results.append(info)
+                except Exception as e:
+                    logger.warning(f"Failed to unrestrict link {link}: {e}")
+                    batch_results.append(None)
+                
+            results.extend(batch_results)
+            
+            # Add delay between batches if not the last batch
+            if i + self.BATCH_SIZE < len(links):
+                time.sleep(self.BATCH_DELAY)
+                
+        return results
+
+    def check_downloads_availability_batch(self, download_ids: List[str]) -> List[Optional[Dict]]:
+        """Check availability for multiple downloads in batches.
+        
+        Args:
+            download_ids: List of download IDs to check
+            
+        Returns:
+            List of availability info dictionaries, None for failed checks
+        """
+        results = []
+        for i in range(0, len(download_ids), self.BATCH_SIZE):
+            batch = download_ids[i:i + self.BATCH_SIZE]
+            batch_results = []
+            
+            for download_id in batch:
+                try:
+                    info = self.request_handler.execute(
+                        HttpMethod.GET,
+                        f"{self.ENDPOINTS['downloads']}/{download_id}"
+                    )
+                    batch_results.append(info)
+                except Exception as e:
+                    if "404" in str(e):
+                        batch_results.append(None)
+                    else:
+                        logger.warning(f"Failed to check download {download_id}: {e}")
+                        batch_results.append(None)
+                
+            results.extend(batch_results)
+            
+            # Add delay between batches if not the last batch
+            if i + self.BATCH_SIZE < len(download_ids):
+                time.sleep(self.BATCH_DELAY)
+                
+        return results
+
 class RealDebridRequestHandler(BaseRequestHandler):
     def handle_response(self, response: Response) -> Any:
         """Handle the API response with proper error handling."""
@@ -296,7 +477,7 @@ class RealDebridRequestHandler(BaseRequestHandler):
             response.raise_for_status()
             return response.json() if response.content else None
             
-        except JSONDecodeError:
+        except json.JSONDecodeError:
             raise RealDebridError(f"Invalid JSON response: {response.text}")
 
     def execute(self, method: HttpMethod, endpoint: str, **kwargs) -> Union[dict, list]:
@@ -1344,7 +1525,7 @@ class RealDebridDownloader(DownloaderBase):
                         logger.error("❌ Empty response from Real-Debrid API")
                         return TorrentAddResult(success=False, error="Empty response from Real-Debrid API", torrent_id="", info={})
             
-                except HTTPError as http_err:
+                except requests.HTTPError as http_err:
                     if http_err.response.status_code == 503:
                         # Don't count 503 errors as rate limit failures
                         logger.warning(f"⚠️ Real-Debrid API temporarily unavailable (503)")
@@ -1661,88 +1842,58 @@ class RealDebridDownloader(DownloaderBase):
             Number of torrents deleted
         """
         try:
-            # Get list of all torrents with rate limit handling
-            with self.rate_limiter:
-                try:
-                    torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
-                except Exception as e:
-                    if "404" in str(e):
-                        logger.debug("No torrents found")
-                        return 0
-                    raise
-                
+            # Get list of all torrents
+            torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
             if not torrents:
                 logger.debug("No torrents found to clean up")
                 return 0
 
-            # Get all downloads in one request to minimize API calls
-            try:
-                downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
-                downloads_by_torrent = {}
-                for download in downloads:
-                    torrent_id = download.get("torrent_id")
-                    if torrent_id:
-                        if torrent_id not in downloads_by_torrent:
-                            downloads_by_torrent[torrent_id] = []
-                        downloads_by_torrent[torrent_id].append(download)
-            except Exception as e:
-                logger.warning(f"Failed to get downloads list: {e}")
-                downloads_by_torrent = {}
+            # Get all downloads in one request
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
+            downloads_by_torrent = {}
+            for download in downloads:
+                torrent_id = download.get("torrent_id")
+                if torrent_id:
+                    downloads_by_torrent.setdefault(torrent_id, []).append(download)
 
-            deleted = 0
-            for torrent in torrents:
-                torrent_id = torrent.get('id')
-                if not torrent_id:
+            # Collect torrent IDs to process
+            torrent_ids = [t['id'] for t in torrents if 'id' in t]
+            if not torrent_ids:
+                return 0
+
+            # Get detailed info for all torrents in batches
+            torrent_infos = self.api.get_torrents_batch(torrent_ids)
+            
+            # Process results and collect items to delete
+            downloads_to_delete = []
+            torrents_to_delete = []
+            
+            for torrent_id, info in zip(torrent_ids, torrent_infos):
+                if info is None:  # Torrent not found
                     continue
-
-                try:
-                    # Get detailed torrent info
-                    info = self._get_torrent_info(torrent_id)
-                    if info is None:
-                        # Torrent already deleted or not found
-                        continue
-
-                    status = info.get('status', '')
-                    reason = self._should_delete_torrent(info, aggressive)
                     
-                    if reason:
-                        # First delete associated downloads
-                        for download in downloads_by_torrent.get(torrent_id, []):
-                            download_id = download.get('id')
-                            if download_id:
-                                try:
-                                    self.api.request_handler.execute(
-                                        HttpMethod.DELETE,
-                                        f"{self.api.ENDPOINTS['download_delete']}/{download_id}"
-                                    )
-                                    logger.debug(f"Deleted download {download_id} associated with torrent {torrent_id}")
-                                except Exception as e:
-                                    if "404" not in str(e):  # Ignore if already deleted
-                                        logger.warning(f"Failed to delete download {download_id}: {e}")
+                reason = self._should_delete_torrent(info, aggressive)
+                if reason:
+                    # Collect associated downloads
+                    for download in downloads_by_torrent.get(torrent_id, []):
+                        download_id = download.get('id')
+                        if download_id:
+                            downloads_to_delete.append(download_id)
+                    
+                    torrents_to_delete.append(torrent_id)
+                    logger.info(f"Marking torrent {torrent_id} for deletion: {reason}")
 
-                        # Then delete the torrent
-                        try:
-                            self.api.request_handler.execute(
-                                HttpMethod.DELETE,
-                                f"{self.api.ENDPOINTS['torrent_delete']}/{torrent_id}"
-                            )
-                            logger.info(f"Deleted torrent {torrent_id}: {reason}")
-                            deleted += 1
-                        except Exception as e:
-                            if "404" not in str(e):  # Ignore if already deleted
-                                logger.error(f"Failed to delete torrent {torrent_id}: {e}")
-                            else:
-                                logger.debug(f"Torrent {torrent_id} was already deleted")
-                                deleted += 1
-                        
-                        # Add a small delay between torrent deletions
-                        time.sleep(1)
+            # Delete downloads in batches
+            if downloads_to_delete:
+                logger.debug(f"Deleting {len(downloads_to_delete)} downloads in batches")
+                self.api.delete_downloads_batch(downloads_to_delete)
 
-                except Exception as e:
-                    logger.error(f"Error processing torrent {torrent_id}: {e}")
-                    continue
+            # Delete torrents in batches
+            if torrents_to_delete:
+                logger.debug(f"Deleting {len(torrents_to_delete)} torrents in batches")
+                self.api.delete_torrents_batch(torrents_to_delete)
 
-            return deleted
+            return len(torrents_to_delete)
 
         except Exception as e:
             logger.error(f"Error cleaning up inactive torrents: {e}")
@@ -1777,10 +1928,10 @@ class RealDebridDownloader(DownloaderBase):
                     if torrent_id in self._torrent_info_cache:
                         del self._torrent_info_cache[torrent_id]
                     return None
-                elif "401" in error_str:
+                elif "401" in str(e):
                     logger.error("API token expired or invalid")
                     raise
-                elif "403" in error_str:
+                elif "403" in str(e):
                     logger.error("Account locked or permission denied")
                     raise
                 else:
@@ -2007,45 +2158,98 @@ class RealDebridDownloader(DownloaderBase):
                     
         return media_files
 
-    def _should_delete_torrent(self, torrent: dict, aggressive: bool) -> Optional[str]:
-        """Determine if a torrent should be deleted based on its status and age.
+    def _get_available_files(self, downloads: List[Dict]) -> List[Dict]:
+        """Get available files from a list of downloads in batches."""
+        if not downloads:
+            return []
+
+        # Extract download IDs
+        download_ids = [d['id'] for d in downloads if 'id' in d]
+        if not download_ids:
+            return []
+
+        # Check availability in batches
+        availability_infos = self.api.check_downloads_availability_batch(download_ids)
         
-        Args:
-            torrent: Torrent info dictionary from the API
-            aggressive: If True, use more aggressive cleanup criteria
+        available_files = []
+        for download, availability in zip(downloads, availability_infos):
+            if not availability:
+                continue
+                
+            if availability.get('status') == 'downloaded':
+                available_files.append(download)
+                
+        return available_files
+
+    def _process_links_batch(self, links: List[str]) -> List[Dict]:
+        """Process multiple links in batches."""
+        if not links:
+            return []
+
+        # Unrestrict links in batches
+        unrestricted_infos = self.api.unrestrict_links_batch(links)
+        
+        processed_links = []
+        for link, info in zip(links, unrestricted_infos):
+            if not info:
+                logger.warning(f"Failed to process link: {link}")
+                continue
+                
+            processed_links.append(info)
+                
+        return processed_links
+
+    async def get_streams(self, magnet_link: str) -> List[Dict]:
+        """Get available streams for a magnet link."""
+        try:
+            # Add the torrent
+            result = await self._add_torrent(magnet_link)
+            if not result.success:
+                return []
+
+            torrent_id = result.torrent_id
+            info = result.info
+
+            # Get available files
+            files = info.get('files', [])
+            if not files:
+                return []
+
+            # Get links for all files
+            links = []
+            for file in files:
+                try:
+                    link = await self._get_download_link(torrent_id, file['id'])
+                    if link:
+                        links.append(link)
+                except Exception as e:
+                    logger.warning(f"Failed to get download link for file {file['id']}: {e}")
+
+            # Process all links in batches
+            processed_links = self._process_links_batch(links)
             
-        Returns:
-            Reason for deletion if torrent should be deleted, None otherwise
-        """
-        status = torrent.get('status', '')
-        time_elapsed = torrent.get('time_elapsed', 0)
-        progress = torrent.get('progress', 0)
-        speed = torrent.get('speed', 0)
-        seeders = torrent.get('seeders', 0)
+            return processed_links
 
-        if status == 'downloading':
-            if time_elapsed > self.CLEANUP_INACTIVE_TIME and speed == 0:
-                return f"download is stuck (zero speed) for {time_elapsed:.0f}s"
-            elif time_elapsed > self.CLEANUP_MINIMAL_PROGRESS_TIME and progress == 0:
-                return f"no progress in {time_elapsed:.0f}s"
-            elif time_elapsed > self.CLEANUP_SLOW_SPEED_TIME and speed < self.CLEANUP_SPEED_THRESHOLD:
-                speed_kb = speed / 1024
-                return f"slow speed ({speed_kb:.1f} KB/s) for {time_elapsed:.0f}s"
-        elif status == 'magnet_conversion':
-            if time_elapsed > self.CLEANUP_MAGNET_TIME:
-                return f"stuck in magnet conversion for {time_elapsed:.0f}s"
-        elif status == 'waiting_files_selection':
-            if time_elapsed > self.CLEANUP_FILE_SELECTION_TIME:
-                return f"stuck waiting for file selection for {time_elapsed:.0f}s"
-        elif status == 'error' or status == 'magnet_error' or status == 'dead':
-            return f"torrent is in {status} state"
-        elif status == 'downloaded':
-            return None  # Don't delete successfully downloaded torrents
-        elif seeders == 0 and time_elapsed > self.CLEANUP_NO_SEEDERS_TIME:
-            return f"download has no seeders for {time_elapsed:.0f}s"
+        except Exception as e:
+            logger.error(f"Error getting streams: {e}")
+            return []
 
-        if aggressive:
-            if time_elapsed > self.CLEANUP_INACTIVE_TIME:
-                return f"torrent is inactive for {time_elapsed:.0f}s"
+    async def cleanup(self, aggressive: bool = False) -> None:
+        """Clean up downloads and torrents."""
+        try:
+            # Get all downloads first
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
+            if downloads:
+                # Process downloads in batches for deletion
+                download_ids = [d['id'] for d in downloads if self._should_delete_download(d)]
+                if download_ids:
+                    logger.info(f"Cleaning up {len(download_ids)} downloads")
+                    self.api.delete_downloads_batch(download_ids)
 
-        return None
+            # Clean up torrents
+            deleted = self._cleanup_inactive_torrents(aggressive)
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} torrents")
+
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
