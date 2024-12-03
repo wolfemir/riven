@@ -12,6 +12,7 @@ from program.services.downloaders.shared import (
 
 from .alldebrid import AllDebridDownloader
 from .realdebrid import RealDebridDownloader, RealDebridAPI, TorrentNotFoundError, InvalidFileIDError
+from .download_manager import DownloadManager
 # from .torbox import TorBoxDownloader
 import os
 import threading

@@ -32,6 +32,8 @@ from .shared import (
     TorrentAddResult
 )
 
+from .download_manager import DownloadManager
+
 # Video file extensions to look for
 VIDEO_EXTENSIONS = {
     'mkv', 'mp4', 'avi', 'mov', 'wmv', 'flv', 'm4v', 'mpg', 'mpeg', 
