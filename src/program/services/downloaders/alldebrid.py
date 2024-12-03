@@ -15,8 +15,7 @@ from program.utils.request import (
     get_rate_limit_params,
 )
 
-from .shared import VIDEO_EXTENSIONS, DownloaderBase, FileFinder, premium_days_left
-
+from .shared import VIDEO_EXTENSIONS, DownloaderBase, FileFinder, premium_days_left, TorrentAddResult
 
 class AllDebridError(Exception):
     """Base exception for AllDebrid related errors"""
@@ -171,7 +170,7 @@ class AllDebridDownloader(DownloaderBase):
                 result[str(i)] = {"filename": name, "filesize": size}
         return result
 
-    def add_torrent(self, infohash: str) -> str:
+    def add_torrent(self, infohash: str) -> TorrentAddResult:
         """
         Add a torrent by infohash
         Required by DownloaderBase
@@ -189,13 +188,21 @@ class AllDebridDownloader(DownloaderBase):
             torrent_id = magnet_info.get("id")
 
             if not torrent_id:
-                raise AllDebridError("No torrent ID in response")
+                return TorrentAddResult(success=False, error="No torrent ID in response")
 
-            return str(torrent_id)
+            # Get torrent info after adding
+            torrent_info = self.get_torrent_info(str(torrent_id))
+            if not torrent_info:
+                return TorrentAddResult(success=False, error="Failed to get torrent info", 
+                                      torrent_id=str(torrent_id))
+
+            return TorrentAddResult(success=True, error=None,
+                                  torrent_id=str(torrent_id), info=torrent_info)
 
         except Exception as e:
-            logger.error(f"Failed to add torrent {infohash}: {e}")
-            raise
+            error_msg = str(e)
+            logger.error(f"Failed to add torrent {infohash}: {error_msg}")
+            return TorrentAddResult(success=False, error=error_msg)
 
     def select_files(self, torrent_id: str, files: List[str]):
         """
