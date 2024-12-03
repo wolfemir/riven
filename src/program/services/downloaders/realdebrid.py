@@ -327,11 +327,21 @@ class RealDebridAPI:
     
     # API endpoints
     ENDPOINTS = {
-        'torrents': 'torrents',
-        'torrents_active': 'torrents/activeCount',  
-        'torrents_info': 'torrents/info',
-        'torrents_completed': 'torrents/completed',
-        'unrestrict': 'unrestrict/link'
+        'torrents': '/torrents',  # GET - Get user torrents list
+        'torrent_info': '/torrents/info',  # GET /{id} - Get info on torrent
+        'torrents_active': '/torrents/activeCount',  # GET - Get currently active torrents
+        'torrents_hosts': '/torrents/availableHosts',  # GET - Get available hosts
+        'torrent_add': '/torrents/addTorrent',  # PUT - Add torrent file
+        'magnet_add': '/torrents/addMagnet',  # POST - Add magnet link
+        'torrent_select': '/torrents/selectFiles',  # POST /{id} - Select files
+        'torrent_delete': '/torrents/delete',  # DELETE /{id} - Delete torrent
+        'downloads': '/downloads',  # GET - Get user downloads list
+        'download_delete': '/downloads/delete',  # DELETE /{id} - Delete download
+        'unrestrict_check': '/unrestrict/check',  # POST - Check a link
+        'unrestrict_link': '/unrestrict/link',  # POST - Unrestrict a link
+        'unrestrict_folder': '/unrestrict/folder',  # POST - Unrestrict a folder link
+        'unrestrict_container_file': '/unrestrict/containerFile',  # PUT - Decrypt container file
+        'unrestrict_container_link': '/unrestrict/containerLink'  # POST - Decrypt container from link
     }
     
     def __init__(self, api_key: str, proxy_url: Optional[str] = None):
@@ -400,6 +410,51 @@ class RealDebridAPI:
                 raise RealDebridError(f"Rate limit exceeded: {error_message}")
             else:
                 raise RealDebridError(f"API error ({error_code}): {error_message}")
+
+    def check_link(self, link: str) -> dict:
+        """Check if a link is valid and get its status."""
+        return self.request_handler.execute(
+            HttpMethod.POST,
+            self.ENDPOINTS['unrestrict_check'],
+            data={'link': link}
+        )
+
+    def unrestrict_link(self, link: str, password: Optional[str] = None) -> dict:
+        """Unrestrict a link and get download information."""
+        data = {'link': link}
+        if password:
+            data['password'] = password
+        return self.request_handler.execute(
+            HttpMethod.POST,
+            self.ENDPOINTS['unrestrict_link'],
+            data=data
+        )
+
+    def unrestrict_folder(self, link: str) -> dict:
+        """Unrestrict a folder link and get its contents."""
+        return self.request_handler.execute(
+            HttpMethod.POST,
+            self.ENDPOINTS['unrestrict_folder'],
+            data={'link': link}
+        )
+
+    def decrypt_container_file(self, file_path: str) -> dict:
+        """Decrypt a container file (dlc, ccf, rsdf)."""
+        with open(file_path, 'rb') as f:
+            files = {'file': f}
+            return self.request_handler.execute(
+                HttpMethod.PUT,
+                self.ENDPOINTS['unrestrict_container_file'],
+                files=files
+            )
+
+    def decrypt_container_link(self, link: str) -> dict:
+        """Decrypt a container file from a link."""
+        return self.request_handler.execute(
+            HttpMethod.POST,
+            self.ENDPOINTS['unrestrict_container_link'],
+            data={'link': link}
+        )
 
 class RealDebridRequestHandler(BaseRequestHandler):
     def __init__(self, session: Session, base_url: str, request_logging: bool = False):
@@ -510,7 +565,7 @@ class RealDebridDownloader(DownloaderBase):
                 return 0
 
             # Get current downloads
-            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
 
             # Get active torrents by status
             active_by_status = defaultdict(list)
@@ -693,14 +748,15 @@ class RealDebridDownloader(DownloaderBase):
         deleted = 0
         # Get all downloads in one request to minimize API calls
         try:
-            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
             downloads_by_torrent = {}
             for download in downloads:
                 torrent_id = download.get("torrent_id")
                 if torrent_id:
-                    if torrent_id not in downloads_by_torrent:
-                        downloads_by_torrent[torrent_id] = []
-                    downloads_by_torrent[torrent_id].append(download['id'])
+                    downloads_by_torrent[torrent_id] = []
+                    for d in downloads:
+                        if d.get("torrent_id") == torrent_id:
+                            downloads_by_torrent[torrent_id].append(d['id'])
         except Exception as e:
             logger.warning(f"Failed to get downloads list: {e}")
             downloads_by_torrent = {}
@@ -711,7 +767,7 @@ class RealDebridDownloader(DownloaderBase):
                 if torrent_id in downloads_by_torrent:
                     for download_id in downloads_by_torrent[torrent_id]:
                         try:
-                            self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download_id}")
+                            self.api.request_handler.execute(HttpMethod.DELETE, f"{self.api.ENDPOINTS['download_delete']}/{download_id}")
                             logger.debug(f"Deleted download {download_id} associated with torrent {torrent_id}")
                             # Add a small delay between requests to respect rate limits
                             time.sleep(0.1)
@@ -719,7 +775,7 @@ class RealDebridDownloader(DownloaderBase):
                             logger.warning(f"Failed to delete download {download_id}: {e}")
 
                 # Then delete the torrent
-                self.api.request_handler.execute(HttpMethod.DELETE, f"torrents/delete/{torrent_id}")
+                self.api.request_handler.execute(HttpMethod.DELETE, f"{self.api.ENDPOINTS['torrent_delete']}/{torrent_id}")
                 logger.info(f"Deleted torrent {torrent_id}: {reason}")
                 deleted += 1
                 # Add a small delay between torrent deletions
@@ -749,7 +805,7 @@ class RealDebridDownloader(DownloaderBase):
             return 0
             
         try:
-            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
             if not isinstance(downloads, list):
                 logger.error(f"Unexpected downloads response type: {type(downloads)}")
                 return 0
@@ -831,7 +887,7 @@ class RealDebridDownloader(DownloaderBase):
                             logger.debug(f"❌ Failed to double-check download status for {self._color_text(download_id, 'red')}: {e}")
                         
                         try:
-                            self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download_id}")
+                            self.api.request_handler.execute(HttpMethod.DELETE, f"{self.api.ENDPOINTS['download_delete']}/{download_id}")
                             deleted += 1
                             logger.info(f"🗑️ Deleted download {self._color_text(download_id, 'yellow')} ({filename}): {reason}, status: {status}")
                             
@@ -998,7 +1054,7 @@ class RealDebridDownloader(DownloaderBase):
                 logger.debug(f"  • Current status: {self._format_status(before_info.get('status', 'unknown'))}")
 
             data = {"files": ",".join(file_ids)}
-            self.api.request_handler.execute(HttpMethod.POST, f"torrents/selectFiles/{torrent_id}", data=data)
+            self.api.request_handler.execute(HttpMethod.POST, f"{self.api.ENDPOINTS['torrent_select']}/{torrent_id}", data=data)
             
             # Get updated torrent info
             after_info = self._get_torrent_info(torrent_id)
@@ -1018,7 +1074,7 @@ class RealDebridDownloader(DownloaderBase):
             # First check active count
             active_info = self.api.request_handler.execute(
                 HttpMethod.GET, 
-                'torrents/activeCount'
+                self.api.ENDPOINTS['torrents_active']
             )
             
             active_count = active_info.get('count', 0)
@@ -1028,7 +1084,7 @@ class RealDebridDownloader(DownloaderBase):
                 # Then get full torrent list only if we have active torrents
                 torrents = self.api.request_handler.execute(
                     HttpMethod.GET,
-                    'torrents'
+                    self.api.ENDPOINTS['torrents']
                 )
                 
                 if not isinstance(torrents, list):
@@ -1095,7 +1151,7 @@ class RealDebridDownloader(DownloaderBase):
         """Finalize download by checking for completed torrents"""
         try:
             # Get completed torrents
-            completed_torrents = self.api.request_handler.execute(HttpMethod.GET, 'torrents/completed')
+            completed_torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
 
             # Find matching torrent
             for torrent in completed_torrents:
@@ -1417,7 +1473,7 @@ class RealDebridDownloader(DownloaderBase):
         
         try:
             # Check active torrents before adding
-            active_count = self.api.request_handler.execute(HttpMethod.GET, "torrents/activeCount")
+            active_count = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_active'])
             if active_count["nb"] >= active_count["limit"]:
                 logger.warning("⚠️ Active limit exceeded, cleaning up inactive torrents...")
                 cleaned = self._cleanup_inactive_torrents()
@@ -1435,7 +1491,7 @@ class RealDebridDownloader(DownloaderBase):
                 try:
                     response = self.api.request_handler.execute(
                         HttpMethod.POST,
-                        "torrents/addMagnet",
+                        self.api.ENDPOINTS['magnet_add'],
                         data={"magnet": magnet}
                     )
                     
@@ -1600,250 +1656,13 @@ class RealDebridDownloader(DownloaderBase):
         try:
             # Get list of all torrents with rate limit handling
             with self.rate_limiter:
-                torrents = self.api.request_handler.execute(HttpMethod.GET, 'torrents')
+                torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
                 
             if not torrents:
                 logger.warning("No torrents found to clean up")
                 return 0
                 
             # Build list of torrents to delete
-            to_delete = []
-            for torrent in torrents:
-                torrent_id = torrent.get("id", "")
-                if not torrent_id or torrent_id in exclude_ids:
-                    continue
-                    
-                status = torrent.get("status", "")
-                if status == RDTorrentStatus.DOWNLOADED.value:
-                    continue  # Don't delete successfully downloaded torrents
-                    
-                reason = f"cleanup_all ({status})"
-                to_delete.append((torrent_id, reason))
-                
-            # Convert to final format
-            to_delete = [(t[0], t[1]) for t in to_delete]
-            
-            # Process deletion in batches
-            if to_delete:
-                logger.debug(f"🗑️ Deleting {len(to_delete)} torrents")
-                return self._batch_delete_torrents(to_delete)
-                
-            return 0
-            
-        except Exception as e:
-            logger.error(f"Error during cleanup_all: {e}")
-            return 0
-
-    def _batch_delete_torrents(self, torrents: List[Tuple[str, str]]) -> int:
-        """Delete a batch of torrents efficiently.
-        Args:
-            torrents: List of (torrent_id, reason) tuples
-        Returns:
-            Number of successfully deleted torrents
-        """
-        deleted = 0
-        # Get all downloads in one request to minimize API calls
-        try:
-            downloads = self.api.request_handler.execute(HttpMethod.GET, 'torrents/completed')
-            downloads_by_torrent = {}
-            for download in downloads:
-                torrent_id = download.get("torrent_id")
-                if torrent_id:
-                    if torrent_id not in downloads_by_torrent:
-                        downloads_by_torrent[torrent_id] = []
-                    downloads_by_torrent[torrent_id].append(download['id'])
-        except Exception as e:
-            logger.warning(f"Failed to get downloads list: {e}")
-            downloads_by_torrent = {}
-
-        for torrent_id, reason in torrents:
-            try:
-                # Delete associated downloads if any
-                if torrent_id in downloads_by_torrent:
-                    for download_id in downloads_by_torrent[torrent_id]:
-                        try:
-                            self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download_id}")
-                            logger.debug(f"Deleted download {download_id} associated with torrent {torrent_id}")
-                            # Add a small delay between requests to respect rate limits
-                            time.sleep(0.1)
-                        except Exception as e:
-                            logger.warning(f"Failed to delete download {download_id}: {e}")
-
-                # Then delete the torrent
-                self.api.request_handler.execute(HttpMethod.DELETE, f"torrents/delete/{torrent_id}")
-                logger.info(f"Deleted torrent {torrent_id}: {reason}")
-                deleted += 1
-                # Add a small delay between torrent deletions
-                time.sleep(0.1)
-            except Exception as e:
-                if "404" in str(e):
-                    # Torrent was already deleted, count it as success
-                    logger.debug(f"Torrent {torrent_id} was already deleted")
-                    deleted += 1
-                elif "401" in str(e):
-                    logger.error("API token expired or invalid")
-                    break  # Stop processing batch
-                elif "403" in str(e):
-                    logger.error("Account locked or permission denied")
-                    break  # Stop processing batch
-                else:
-                    logger.error(f"Failed to delete torrent {torrent_id}: {e}")
-        return deleted
-
-    def _get_torrent_info(self, torrent_id: str) -> Optional[Dict]:
-        """Get detailed info for a torrent with error handling and caching."""
-        try:
-            # Use class-level cache to avoid duplicate requests
-            if not hasattr(self, '_torrent_info_cache'):
-                self._torrent_info_cache = {}
-            
-            # Check cache first
-            cache_key = f"{torrent_id}_{int(time.time() / 30)}"  # Cache for 30 seconds
-            if cache_key in self._torrent_info_cache:
-                return self._torrent_info_cache[cache_key]
-            
-            logger.debug(f"📡 Fetching info for torrent {torrent_id}")
-            info = self.api.request_handler.execute(
-                HttpMethod.GET,
-                f"torrents/info/{torrent_id}"
-            )
-            
-            # Cache the result
-            self._torrent_info_cache[cache_key] = info
-            return info
-            
-        except Exception as e:
-            logger.error(f"❌ Error getting torrent info for {torrent_id}: {str(e)}")
-            return None
-
-    def get_torrent_info(self, torrent_id: str) -> dict:
-        """
-        Get information about a torrent
-        Required by DownloaderBase
-        """
-        if not self.initialized:
-            raise RealDebridError("Downloader not properly initialized")
-
-        response = self.api.request_handler.execute(
-            HttpMethod.GET,
-            f"torrents/info/{torrent_id}"
-        )
-        
-        # Log a cleaner version with just the important info
-        if response:
-            status = response.get('status', 'unknown')
-            progress = response.get('progress', 0)
-            speed = response.get('speed', 0)
-            seeders = response.get('seeders', 0)
-            filename = response.get('filename', 'unknown')
-            files = response.get('files', [])
-            
-            speed_mb = speed / 1000000 if speed else 0  # Convert to MB/s
-            
-            logger.debug(
-                f"📊 {self._format_progress(progress, speed_mb, seeders)}\n"
-                f"🎬 Processing file: {filename}"
-            )
-            
-            # Log file details if available
-            if files:
-                logger.debug("📁 Available files:")
-                for f in files:
-                    logger.debug(f"- {f.get('path', 'unknown')} ({f.get('bytes', 0)} bytes)")
-        
-        return response
-
-    def delete_torrent(self, torrent_id: str):
-        """
-        Delete a torrent
-        Required by DownloaderBase
-        """
-        if not self.initialized:
-            raise RealDebridError("Downloader not properly initialized")
-
-        try:
-            self.api.request_handler.execute(
-                HttpMethod.DELETE,
-                f"torrents/delete/{torrent_id}"
-            )
-        except Exception as e:
-            error_str = str(e)
-            if "404" in error_str:
-                # Could mean: already deleted, invalid ID, or never existed
-                logger.warning(f"Could not delete torrent {torrent_id}: Unknown resource (404)")
-                return
-            elif "401" in str(e):
-                logger.error("API token expired or invalid")
-                raise
-            elif "403" in str(e):
-                logger.error("Account locked or permission denied")
-                raise
-            else:
-                logger.error(f"Failed to delete torrent {torrent_id}: {error_str}")
-                raise
-
-    def _can_start_download(self, content_id: str) -> bool:
-        """Check if we can start a new download for this content."""
-        with self._lock:
-            # Check if this content is already complete
-            if self._is_content_complete(content_id):
-                logger.debug(f"Content {content_id} already complete")
-                return False
-
-            # Get total unique content IDs currently downloading
-            active_content_ids = set(self.active_downloads.keys())
-            if len(active_content_ids) >= self.MAX_CONCURRENT_CONTENT and content_id not in active_content_ids:
-                logger.warning(f"⚠️ Too many content items downloading ({len(active_content_ids)}/{self.MAX_CONCURRENT_CONTENT})")
-                return False
-
-            # Check per-content limit
-            active_for_content = len(self.active_downloads.get(content_id, set()))
-            if active_for_content >= self.MAX_CONCURRENT_PER_CONTENT:
-                logger.warning(f"⚠️ Too many downloads for content {content_id} ({active_for_content}/{self.MAX_CONCURRENT_PER_CONTENT})")
-                return False
-
-            # Check total concurrent limit
-            total_active = sum(len(downloads) for downloads in self.active_downloads.values())
-            if total_active >= self.MAX_CONCURRENT_TOTAL:
-                logger.warning(f"⚠️ Too many total concurrent downloads ({total_active}/{self.MAX_CONCURRENT_TOTAL})")
-                return False
-
-            return True
-
-    def _is_active_status(self, status: str) -> bool:
-        """Check if a torrent status counts as active."""
-        return status in ("downloading", "uploading", "compressing", "magnet_conversion", "waiting_files_selection")
-
-    def _cleanup_inactive_torrents(self) -> int:
-        """Clean up inactive, errored, or stalled torrents to free up slots.
-        Returns number of torrents cleaned up."""
-        current_time = time.time()
-        if (current_time - self.last_cleanup_time) < self.CLEANUP_PROGRESS_CHECK_INTERVAL:
-            return 0
-            
-        try:
-            # Get active torrent count
-            try:
-                active_count = self.api.request_handler.execute(HttpMethod.GET, "torrents/activeCount")
-                logger.debug(f"Active torrents: {self._format_count(active_count['nb'], active_count['limit'])}")
-                
-                # Calculate cleanup aggressiveness based on how far over limit we are
-                overage = active_count["nb"] - active_count["limit"]
-                extremely_aggressive = overage >= 5
-                aggressive_cleanup = overage > 0
-                
-                if overage > 0:
-                    logger.warning(f"⚠️ Over active torrent limit by {overage} torrents")
-                elif active_count["nb"] < active_count["limit"]:
-                    logger.debug("✅ Under active torrent limit")
-                    return 0
-            except Exception as e:
-                logger.warning(f"Failed to get active torrent count: {e}")
-                extremely_aggressive = True
-                aggressive_cleanup = True
-            
-            # Get list of all torrents
-            torrents = self.api.request_handler.execute(HttpMethod.GET, 'torrents')
             to_delete = []  # List of (priority, torrent_id, reason) tuples
             
             # Track torrents by various attributes
@@ -1975,6 +1794,276 @@ class RealDebridDownloader(DownloaderBase):
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
+
+    def _cleanup_inactive_torrents(self, aggressive: bool = False) -> int:
+        """Clean up inactive torrents and their associated downloads.
+        
+        Args:
+            aggressive: If True, use more aggressive cleanup criteria
+            
+        Returns:
+            Number of torrents deleted
+        """
+        try:
+            # Get list of all torrents with rate limit handling
+            with self.rate_limiter:
+                torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
+                
+            if not torrents:
+                logger.warning("No torrents found to clean up")
+                return 0
+
+            # Get all downloads in one request to minimize API calls
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
+            downloads_by_torrent = {}
+            for download in downloads:
+                torrent_id = download.get("torrent_id")
+                if torrent_id:
+                    downloads_by_torrent.setdefault(torrent_id, []).append(download)
+
+            deleted = 0
+            for torrent in torrents:
+                torrent_id = torrent.get('id')
+                if not torrent_id:
+                    continue
+
+                status = torrent.get('status', '')
+                reason = self._should_delete_torrent(torrent, aggressive)
+                
+                if reason:
+                    # First delete associated downloads
+                    for download in downloads_by_torrent.get(torrent_id, []):
+                        download_id = download.get('id')
+                        if download_id:
+                            try:
+                                self.api.request_handler.execute(HttpMethod.DELETE, f"{self.api.ENDPOINTS['download_delete']}/{download_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to delete download {download_id}: {e}")
+
+                    # Then delete the torrent
+                    self.api.request_handler.execute(HttpMethod.DELETE, f"{self.api.ENDPOINTS['torrent_delete']}/{torrent_id}")
+                    logger.info(f"Deleted torrent {torrent_id}: {reason}")
+                    deleted += 1
+                    # Add a small delay between torrent deletions
+                    time.sleep(1)
+
+            return deleted
+
+        except Exception as e:
+            logger.error(f"Error cleaning up inactive torrents: {e}")
+            return 0
+
+    def _should_delete_torrent(self, torrent: dict, aggressive: bool) -> str:
+        """Determine if a torrent should be deleted based on its status and age."""
+        status = torrent.get('status', '')
+        time_elapsed = torrent.get('time_elapsed', 0)
+        progress = torrent.get('progress', 0)
+        speed = torrent.get('speed', 0)
+        seeders = torrent.get('seeders', 0)
+
+        if status == 'downloading':
+            if time_elapsed > self.CLEANUP_INACTIVE_TIME and speed == 0:
+                return f"download is stuck (zero speed) for {time_elapsed:.0f}s"
+            elif time_elapsed > self.CLEANUP_MINIMAL_PROGRESS_TIME and progress == 0:
+                return f"no progress in {time_elapsed:.0f}s"
+            elif time_elapsed > self.CLEANUP_SLOW_SPEED_TIME and speed < self.CLEANUP_SPEED_THRESHOLD:
+                speed_kb = speed / 1024
+                return f"slow speed ({speed_kb:.1f} KB/s) for {time_elapsed:.0f}s"
+        elif status == 'magnet_conversion':
+            if time_elapsed > self.CLEANUP_MAGNET_TIME:
+                return f"stuck in magnet conversion for {time_elapsed:.0f}s"
+        elif status == 'waiting_files_selection':
+            if time_elapsed > self.CLEANUP_FILE_SELECTION_TIME:
+                return f"stuck waiting for file selection for {time_elapsed:.0f}s"
+        elif status == 'error' or status == 'magnet_error' or status == 'dead':
+            return f"torrent is in {status} state"
+        elif status == 'downloaded':
+            return None  # Don't delete successfully downloaded torrents
+        elif seeders == 0 and time_elapsed > self.CLEANUP_NO_SEEDERS_TIME:
+            return f"download has no seeders for {time_elapsed:.0f}s"
+
+        if aggressive:
+            if time_elapsed > self.CLEANUP_INACTIVE_TIME:
+                return f"torrent is inactive for {time_elapsed:.0f}s"
+
+        return None
+
+    def _batch_delete_torrents(self, torrents: List[Tuple[str, str]]) -> int:
+        """Delete a batch of torrents efficiently.
+        Args:
+            torrents: List of (torrent_id, reason) tuples
+        Returns:
+            Number of successfully deleted torrents
+        """
+        deleted = 0
+        # Get all downloads in one request to minimize API calls
+        try:
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['downloads'])
+            downloads_by_torrent = {}
+            for download in downloads:
+                torrent_id = download.get("torrent_id")
+                if torrent_id:
+                    downloads_by_torrent.setdefault(torrent_id, []).append(download)
+        except Exception as e:
+            logger.warning(f"Failed to get downloads list: {e}")
+            downloads_by_torrent = {}
+
+        for torrent_id, reason in torrents:
+            try:
+                # Delete associated downloads if any
+                if torrent_id in downloads_by_torrent:
+                    for download in downloads_by_torrent[torrent_id]:
+                        download_id = download.get('id')
+                        if download_id:
+                            try:
+                                self.api.request_handler.execute(HttpMethod.DELETE, f"{self.api.ENDPOINTS['download_delete']}/{download_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to delete download {download_id}: {e}")
+
+                # Then delete the torrent
+                self.api.request_handler.execute(HttpMethod.DELETE, f"{self.api.ENDPOINTS['torrent_delete']}/{torrent_id}")
+                logger.info(f"Deleted torrent {torrent_id}: {reason}")
+                deleted += 1
+                # Add a small delay between torrent deletions
+                time.sleep(1)
+            except Exception as e:
+                if "404" in str(e):
+                    # Torrent was already deleted, count it as success
+                    logger.debug(f"Torrent {torrent_id} was already deleted")
+                    deleted += 1
+                elif "401" in str(e):
+                    logger.error("API token expired or invalid")
+                    break  # Stop processing batch
+                elif "403" in str(e):
+                    logger.error("Account locked or permission denied")
+                    break  # Stop processing batch
+                else:
+                    logger.error(f"Failed to delete torrent {torrent_id}: {e}")
+        return deleted
+
+    def _get_torrent_info(self, torrent_id: str) -> Optional[Dict]:
+        """Get detailed info for a torrent with error handling and caching."""
+        try:
+            # Use class-level cache to avoid duplicate requests
+            if not hasattr(self, '_torrent_info_cache'):
+                self._torrent_info_cache = {}
+            
+            # Check cache first
+            cache_key = f"{torrent_id}_{int(time.time() / 30)}"  # Cache for 30 seconds
+            if cache_key in self._torrent_info_cache:
+                return self._torrent_info_cache[cache_key]
+            
+            logger.debug(f"📡 Fetching info for torrent {torrent_id}")
+            info = self.api.request_handler.execute(
+                HttpMethod.GET,
+                f"{self.api.ENDPOINTS['torrent_info']}/{torrent_id}"
+            )
+            
+            # Cache the result
+            self._torrent_info_cache[cache_key] = info
+            return info
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting torrent info for {torrent_id}: {str(e)}")
+            return None
+
+    def get_torrent_info(self, torrent_id: str) -> dict:
+        """
+        Get information about a torrent
+        Required by DownloaderBase
+        """
+        if not self.initialized:
+            raise RealDebridError("Downloader not properly initialized")
+
+        response = self.api.request_handler.execute(
+            HttpMethod.GET,
+            f"{self.api.ENDPOINTS['torrent_info']}/{torrent_id}"
+        )
+        
+        # Log a cleaner version with just the important info
+        if response:
+            status = response.get('status', 'unknown')
+            progress = response.get('progress', 0)
+            speed = response.get('speed', 0)
+            seeders = response.get('seeders', 0)
+            filename = response.get('filename', 'unknown')
+            files = response.get('files', [])
+            
+            speed_mb = speed / 1000000 if speed else 0  # Convert to MB/s
+            
+            logger.debug(
+                f"📊 {self._format_progress(progress, speed_mb, seeders)}\n"
+                f"🎬 Processing file: {filename}"
+            )
+            
+            # Log file details if available
+            if files:
+                logger.debug("📁 Available files:")
+                for f in files:
+                    logger.debug(f"- {f.get('path', 'unknown')} ({f.get('bytes', 0)} bytes)")
+        
+        return response
+
+    def delete_torrent(self, torrent_id: str):
+        """
+        Delete a torrent
+        Required by DownloaderBase
+        """
+        if not self.initialized:
+            raise RealDebridError("Downloader not properly initialized")
+
+        try:
+            self.api.request_handler.execute(
+                HttpMethod.DELETE,
+                f"{self.api.ENDPOINTS['torrent_delete']}/{torrent_id}"
+            )
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str:
+                # Could mean: already deleted, invalid ID, or never existed
+                logger.warning(f"Could not delete torrent {torrent_id}: Unknown resource (404)")
+                return
+            elif "401" in str(e):
+                logger.error("API token expired or invalid")
+                raise
+            elif "403" in str(e):
+                logger.error("Account locked or permission denied")
+                raise
+            else:
+                logger.error(f"Failed to delete torrent {torrent_id}: {error_str}")
+                raise
+
+    def _can_start_download(self, content_id: str) -> bool:
+        """Check if we can start a new download for this content."""
+        with self._lock:
+            # Check if this content is already complete
+            if self._is_content_complete(content_id):
+                logger.debug(f"Content {content_id} already complete")
+                return False
+
+            # Get total unique content IDs currently downloading
+            active_content_ids = set(self.active_downloads.keys())
+            if len(active_content_ids) >= self.MAX_CONCURRENT_CONTENT and content_id not in active_content_ids:
+                logger.warning(f"⚠️ Too many content items downloading ({len(active_content_ids)}/{self.MAX_CONCURRENT_CONTENT})")
+                return False
+
+            # Check per-content limit
+            active_for_content = len(self.active_downloads.get(content_id, set()))
+            if active_for_content >= self.MAX_CONCURRENT_PER_CONTENT:
+                logger.warning(f"⚠️ Too many downloads for content {content_id} ({active_for_content}/{self.MAX_CONCURRENT_PER_CONTENT})")
+                return False
+
+            # Check total concurrent limit
+            total_active = sum(len(downloads) for downloads in self.active_downloads.values())
+            if total_active >= self.MAX_CONCURRENT_TOTAL:
+                logger.warning(f"⚠️ Too many total concurrent downloads ({total_active}/{self.MAX_CONCURRENT_TOTAL})")
+                return False
+
+            return True
+
+    def _is_active_status(self, status: str) -> bool:
+        """Check if a torrent status counts as active."""
+        return status in ("downloading", "uploading", "compressing", "magnet_conversion", "waiting_files_selection")
 
     def _check_seeders(self, info: dict, elapsed: float, seeder_check_count: int) -> Tuple[bool, str]:
         """
