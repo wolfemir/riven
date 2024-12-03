@@ -8,9 +8,8 @@ NC='\033[0m'
 # Docker repository
 DOCKER_REPO="machetienew/riven"
 
-# Get the latest tag and increment it
-LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.3.5")
-LATEST_TAG=${LATEST_TAG#v} # Remove 'v' prefix
+# Get the latest docker tag and increment it
+LATEST_TAG=$(docker images ${DOCKER_REPO} --format "{{.Tag}}" | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n1 || echo "0.3.5")
 
 # Split version into major, minor, and patch
 IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_TAG"
@@ -28,7 +27,7 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 
 # Generate changelog
 echo -e "${YELLOW}Generating changelog...${NC}"
-CHANGELOG=$(git log --pretty=format:"- %s" $(git describe --tags --abbrev=0)..HEAD)
+CHANGELOG=$(git log --pretty=format:"- %s" HEAD~1..HEAD)
 
 # Create commit message with conventional commit format and changelog
 COMMIT_MSG="feat(release): version ${VERSION}
@@ -46,10 +45,9 @@ git add .
 echo -e "${YELLOW}Committing changes...${NC}"
 git commit -m "$COMMIT_MSG"
 
-# Create and push tag
-echo -e "${YELLOW}Creating and pushing tag v${VERSION}...${NC}"
-git tag -a "v${VERSION}" -m "Release version ${VERSION}"
-git push origin main --tags
+# Push changes to branch
+echo -e "${YELLOW}Pushing changes to branch...${NC}"
+git push origin HEAD
 
 # Build Docker image
 echo -e "${YELLOW}Building Docker image...${NC}"
