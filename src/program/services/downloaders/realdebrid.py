@@ -612,25 +612,39 @@ class RealDebridDownloader(DownloaderBase):
             Number of successfully deleted torrents
         """
         deleted = 0
+        # Get all downloads in one request to minimize API calls
+        try:
+            downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
+            downloads_by_torrent = {}
+            for download in downloads:
+                torrent_id = download.get("torrent_id")
+                if torrent_id:
+                    if torrent_id not in downloads_by_torrent:
+                        downloads_by_torrent[torrent_id] = []
+                    downloads_by_torrent[torrent_id].append(download['id'])
+        except Exception as e:
+            logger.warning(f"Failed to get downloads list: {e}")
+            downloads_by_torrent = {}
+
         for torrent_id, reason in torrents:
             try:
-                # First try to delete associated downloads
-                try:
-                    downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
-                    for download in downloads:
-                        if download.get("torrent_id") == torrent_id:
-                            try:
-                                self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download['id']}")
-                                logger.debug(f"Deleted download {download['id']} associated with torrent {torrent_id}")
-                            except Exception as e:
-                                logger.warning(f"Failed to delete download {download['id']}: {e}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup downloads for torrent {torrent_id}: {e}")
+                # Delete associated downloads if any
+                if torrent_id in downloads_by_torrent:
+                    for download_id in downloads_by_torrent[torrent_id]:
+                        try:
+                            self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download_id}")
+                            logger.debug(f"Deleted download {download_id} associated with torrent {torrent_id}")
+                            # Add a small delay between requests to respect rate limits
+                            time.sleep(0.1)
+                        except Exception as e:
+                            logger.warning(f"Failed to delete download {download_id}: {e}")
 
                 # Then delete the torrent
                 self.api.request_handler.execute(HttpMethod.DELETE, f"torrents/delete/{torrent_id}")
                 logger.info(f"Deleted torrent {torrent_id}: {reason}")
                 deleted += 1
+                # Add a small delay between torrent deletions
+                time.sleep(0.1)
             except Exception as e:
                 if "404" in str(e):
                     # Torrent was already deleted, count it as success
@@ -1555,25 +1569,39 @@ class RealDebridDownloader(DownloaderBase):
             Number of successfully deleted torrents
         """
         deleted = 0
+        # Get all downloads in one request to minimize API calls
+        try:
+            downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
+            downloads_by_torrent = {}
+            for download in downloads:
+                torrent_id = download.get("torrent_id")
+                if torrent_id:
+                    if torrent_id not in downloads_by_torrent:
+                        downloads_by_torrent[torrent_id] = []
+                    downloads_by_torrent[torrent_id].append(download['id'])
+        except Exception as e:
+            logger.warning(f"Failed to get downloads list: {e}")
+            downloads_by_torrent = {}
+
         for torrent_id, reason in torrents:
             try:
-                # First try to delete associated downloads
-                try:
-                    downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
-                    for download in downloads:
-                        if download.get("torrent_id") == torrent_id:
-                            try:
-                                self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download['id']}")
-                                logger.debug(f"Deleted download {download['id']} associated with torrent {torrent_id}")
-                            except Exception as e:
-                                logger.warning(f"Failed to delete download {download['id']}: {e}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup downloads for torrent {torrent_id}: {e}")
+                # Delete associated downloads if any
+                if torrent_id in downloads_by_torrent:
+                    for download_id in downloads_by_torrent[torrent_id]:
+                        try:
+                            self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download_id}")
+                            logger.debug(f"Deleted download {download_id} associated with torrent {torrent_id}")
+                            # Add a small delay between requests to respect rate limits
+                            time.sleep(0.1)
+                        except Exception as e:
+                            logger.warning(f"Failed to delete download {download_id}: {e}")
 
                 # Then delete the torrent
                 self.api.request_handler.execute(HttpMethod.DELETE, f"torrents/delete/{torrent_id}")
                 logger.info(f"Deleted torrent {torrent_id}: {reason}")
                 deleted += 1
+                # Add a small delay between torrent deletions
+                time.sleep(0.1)
             except Exception as e:
                 if "404" in str(e):
                     # Torrent was already deleted, count it as success
@@ -1896,16 +1924,3 @@ class RealDebridDownloader(DownloaderBase):
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
-
-    def _get_media_file_ids(self, torrent_info: dict) -> List[str]:
-        """Get IDs of media files from torrent info.
-        
-        Args:
-            torrent_info: Torrent information dictionary containing files
-            
-        Returns:
-            List of file IDs for media files
-        """
-        files = torrent_info.get("files", [])
-        processed = self._process_files(files)
-        return list(processed.keys()) if processed else []
