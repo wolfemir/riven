@@ -1388,15 +1388,29 @@ class RealDebridDownloader(DownloaderBase):
             # Get user account info
             response = self.api.request_handler.execute(HttpMethod.GET, '/user')
             
-            if not isinstance(response, dict):
+            # Handle both dict and namespace responses
+            if hasattr(response, 'premium'):
+                is_premium = bool(response.premium)
+                expiration = getattr(response, 'expiration', None)
+            elif isinstance(response, dict):
+                is_premium = bool(response.get('premium'))
+                expiration = response.get('expiration')
+            else:
                 logger.error("Invalid response format from Real-Debrid API")
                 return False
                 
-            # Check premium status
-            premium = response.get('premium', False)
-            if not premium:
+            if not is_premium:
                 logger.error("Account is not premium")
                 return False
+                
+            # Log expiration if available
+            if expiration:
+                try:
+                    expiry_date = datetime.fromisoformat(expiration.replace('Z', '+00:00'))
+                    days_left = (expiry_date - datetime.now(timezone.utc)).days
+                    logger.info(f"Premium account active - expires in {days_left} days")
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not parse expiration date: {e}")
                 
             return True
             
