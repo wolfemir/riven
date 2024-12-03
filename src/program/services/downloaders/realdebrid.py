@@ -1506,190 +1506,45 @@ class RealDebridDownloader(DownloaderBase):
         """Format deletion message"""
         return self._color_text(f"🗑️ {reason}", 'red')
 
-    def _cleanup_all_except(self, exclude_ids: Set[str] = None) -> bool:
+    def _cleanup_all_except(self, exclude_ids: Set[str] = None) -> int:
         """Clean up all non-downloaded torrents except those in exclude_ids"""
-        exclude_ids = exclude_ids or set()
-        cleaned_ids = set()
-
-        try:
-            # Get all torrents with retries
-            max_retries = 3
-            retry_count = 0
-            torrents = None
-
-            while retry_count < max_retries:
-                try:
-                    torrents = self._api_request_with_backoff(
-                        HttpMethod.GET,
-                        "torrents",
-                        max_attempts=5
-                    )
-                    if isinstance(torrents, list):
-                        break
-                    retry_count += 1
-                    time.sleep(5)
-                except Exception as e:
-                    logger.warning(f"Failed to get torrents (attempt {retry_count + 1}/{max_retries}): {e}")
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        time.sleep(5)
-
-            if not isinstance(torrents, list):
-                logger.error(f"Invalid response from torrents endpoint after {max_retries} attempts")
-                return False
-
-            # First check active torrent count
-            try:
-                active_count = self.api.request_handler.execute(HttpMethod.GET, "torrents/activeCount")
-                logger.debug(f"⚠️ At active torrent limit {self._format_count(active_count['nb'], active_count['limit'])}")
-                if active_count["nb"] < active_count["limit"]:
-                    return 0
-                
-                # Calculate how aggressive we should be based on how far over the limit we are
-                overage = active_count["nb"] - active_count["limit"]
-                logger.warning(f"Over active torrent limit by {overage} torrents")
-                # If we're over by more than 5, be extremely aggressive
-                extremely_aggressive = overage >= 5
-                # If we're over by any amount, be somewhat aggressive
-                aggressive_cleanup = overage > 0
-            except Exception as e:
-                logger.warning(f"Failed to get active torrent count: {e}")
-                extremely_aggressive = True  # Be extremely aggressive if we can't check
-                aggressive_cleanup = True
+        if exclude_ids is None:
+            exclude_ids = set()
             
-            # Get list of all torrents
-            torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
-            to_delete = []  # List of (priority, torrent_id, reason) tuples
-            cleaned = 0
-            
-            # Count active torrents by status and collect stats
-            active_by_status = defaultdict(list)
-            magnet_times = []  # Track magnet conversion times
-            downloading_stats = []  # Track download stats
-            total_active = 0
-            
-            # Track duplicates by filename
-            filename_to_torrents = defaultdict(list)
-            
-            for torrent in torrents:
-                status = torrent.get("status", "")
-                if self._is_active_status(status):
-                    # Calculate time_elapsed first
-                    time_elapsed = 0
-                    try:
-                        added = torrent.get("added", "")
-                        if added:
-                            # Convert to UTC, then to local time
-                            added_time = datetime.fromisoformat(added.replace("Z", "+00:00"))
-                            added_time = added_time.astimezone().replace(tzinfo=None)
-                            time_elapsed = (datetime.now() - added_time).total_seconds()
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid timestamp format for torrent: {torrent.get('added')}")
-                    
-                    torrent_stats = {
-                        "status": status,
-                        "filename": torrent.get("filename", "unknown"),
-                        "progress": torrent.get("progress", 0),
-                        "speed": torrent.get("speed", 0),
-                        "seeders": torrent.get("seeders", 0),
-                        "time_elapsed": time_elapsed,
-                        "id": torrent.get("id", "")
-                    }
-                    
-                    active_by_status[status].append(torrent_stats)
-                    filename_to_torrents[torrent_stats["filename"]].append(torrent_stats)
-                    total_active += 1
-                    
-                    if status == "magnet_conversion" and time_elapsed > 0:
-                        magnet_times.append(time_elapsed)
-                    elif status == "downloading":
-                        downloading_stats.append(torrent_stats)
-            
-            # First handle duplicates - keep only the most progressed version of each file
-            for filename, dupes in filename_to_torrents.items():
-                if len(dupes) > 1:
-                    logger.info(f"Found {len(dupes)} duplicates of {filename}")
-                    # Sort by progress (highest first), then by speed (highest first)
-                    dupes.sort(key=lambda x: (x["progress"], x["speed"]), reverse=True)
-                    
-                    # Keep the best one, mark others for deletion
-                    best = dupes[0]
-                    logger.info(f"Keeping best duplicate: {best['progress']}% @ {best['speed']/1024:.1f} KB/s")
-                    
-                    for dupe in dupes[1:]:
-                        reason = (f"duplicate of {filename} "
-                                f"(keeping: {best['progress']}% @ {best['speed']/1024:.1f} KB/s, "
-                                f"removing: {dupe['progress']}% @ {dupe['speed']/1024:.1f} KB/s)")
-                        to_delete.append((150, dupe["id"], reason, dupe["time_elapsed"]))  # Highest priority for duplicates
-                        logger.info(f"Marking duplicate for deletion: {reason}")
-            
-            # Find stalled or problematic torrents
-            stalled_threshold = 60  # 1 minute without progress
-            near_complete_threshold = 95.0  # Protect torrents above this %
-            min_speed_threshold = 100 * 1024  # 100 KB/s minimum speed
-            
-            for status, torrents in active_by_status.items():
-                for t in torrents:
-                    # Skip nearly complete downloads unless they're completely stalled
-                    if t["progress"] >= near_complete_threshold:
-                        if t["speed"] == 0:
-                            logger.warning(f"Nearly complete torrent stalled: {t['filename']} at {t['progress']}%")
-                            reason = f"stalled at {t['progress']}% complete (no speed for {t['time_elapsed']/60:.1f}m)"
-                            to_delete.append((90, t["id"], reason, t["time_elapsed"]))
-                        continue
-                    
-                    # Check for stalled downloads
-                    if status == "downloading":
-                        # No seeders and no progress for 2 minutes
-                        if t["speed"] == 0 and t["seeders"] == 0:
-                            if t["time_elapsed"] > 120:  # Reduced from 300s to 120s
-                                reason = f"stalled with no seeders (file: {t['filename']}, progress: {t['progress']}%)"
-                                to_delete.append((90, t["id"], reason))
-                        # Extremely slow downloads
-                        elif t["speed"] < self.CLEANUP_SPEED_THRESHOLD:
-                            if t["time_elapsed"] > 300:  # Reduced from 900s to 300s
-                                speed_kb = t["speed"] / 1024
-                                reason = f"extremely slow ({speed_kb:.1f} KB/s) (file: {t['filename']}, progress: {t['progress']}%)"
-                                to_delete.append((80, t["id"], reason))
-                        # No progress in 5 minutes
-                        elif t["progress"] == 0 and t["time_elapsed"] > 300:
-                            reason = f"no progress in 5 minutes (file: {t['filename']})"
-                            to_delete.append((85, t["id"], reason))
-                    
-                    # Check for stuck magnet conversions
-                    elif status == "magnet_conversion" and t["time_elapsed"] > 300:  # Reduced from 600s to 300s
-                        reason = f"stuck in magnet conversion for {t['time_elapsed']:.0f}s"
-                        to_delete.append((70, t["id"], reason))
-                
-                    # Check for stuck waiting for selection
-                    elif status == "waiting_files_selection" and t["time_elapsed"] > 120:  # New check
-                        reason = f"stuck waiting for file selection for {t['time_elapsed']:.0f}s"
-                        to_delete.append((75, t["id"], reason))
+        logger.debug(f"🧹 Cleaning up all torrents except {len(exclude_ids)} excluded IDs")
         
-            # Handle duplicates - only if we're being aggressive
-            if aggressive_cleanup:
-                for filename, dupes in filename_to_torrents.items():
-                    if len(dupes) > 1:
-                        # Sort by progress (highest first), then by speed, then by seeders
-                        dupes.sort(key=lambda x: (x["progress"], x["speed"], x["seeders"]), reverse=True)
-                        best = dupes[0]
-                        
-                        # Delete all duplicates except the best one
-                        for dupe in dupes[1:]:
-                            reason = f"duplicate of {best['filename']} ({best['progress']}% vs {dupe['progress']}%)"
-                            to_delete.append((60, dupe["id"], reason))
-            
-            # Sort by priority (highest first) and delete
-            if to_delete:
-                to_delete.sort(reverse=True)
-                delete_batch = [(t[1], t[2]) for t in to_delete]  # Convert to (id, reason) tuples
-                cleaned = self._batch_delete_torrents(delete_batch)
+        try:
+            # Get list of all torrents with rate limit handling
+            with self.rate_limiter:
+                torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
                 
-            self.last_cleanup_time = datetime.now()
-            return cleaned
+            if not torrents:
+                logger.warning("No torrents found to clean up")
+                return 0
+                
+            # Build list of torrents to delete
+            to_delete = []
+            for torrent in torrents:
+                torrent_id = torrent.get("id")
+                if not torrent_id or torrent_id in exclude_ids:
+                    continue
+                    
+                status = torrent.get("status", "")
+                if status == RDTorrentStatus.DOWNLOADED.value:
+                    continue  # Don't delete successfully downloaded torrents
+                    
+                reason = f"cleanup_all ({status})"
+                to_delete.append((torrent_id, reason))
+                
+            # Delete torrents in batches
+            if to_delete:
+                logger.debug(f"🗑️ Deleting {len(to_delete)} torrents")
+                return self._batch_delete_torrents(to_delete)
+                
+            return 0
             
         except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            logger.error(f"Error during cleanup_all: {e}")
             return 0
 
     def _batch_delete_torrents(self, torrents: List[Tuple[str, str]]) -> int:
@@ -2042,16 +1897,3 @@ class RealDebridDownloader(DownloaderBase):
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
-
-    def _get_media_file_ids(self, torrent_info: dict) -> List[str]:
-        """Get IDs of media files from torrent info.
-        
-        Args:
-            torrent_info: Torrent information dictionary containing files
-            
-        Returns:
-            List of file IDs for media files
-        """
-        files = torrent_info.get("files", [])
-        processed = self._process_files(files)
-        return list(processed.keys()) if processed else []
