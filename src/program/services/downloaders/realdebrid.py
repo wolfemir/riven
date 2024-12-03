@@ -1099,7 +1099,12 @@ class RealDebridDownloader(DownloaderBase):
                 self.api.ENDPOINTS['torrents_active']
             )
             
-            active_count = active_info.get('count', 0)
+            # Handle namespace response
+            if hasattr(active_info, 'nb'):
+                active_count = active_info.nb
+            else:
+                active_count = active_info.get('count', 0) if isinstance(active_info, dict) else 0
+                
             if active_count > 0:
                 logger.debug(f"🔍 Found {active_count} active torrents")
                 
@@ -1109,15 +1114,22 @@ class RealDebridDownloader(DownloaderBase):
                     self.api.ENDPOINTS['torrents']
                 )
                 
-                if not isinstance(torrents, list):
+                # Handle namespace response for torrents list
+                if hasattr(torrents, 'list'):
+                    torrents = torrents.list
+                elif not isinstance(torrents, list):
                     logger.error(f"Unexpected torrents response type: {type(torrents)}")
                     return DownloadCachedStreamResult(success=False, error="Invalid API response format")
                 
-                # Filter active torrents
-                active_torrents = [
-                    t['id'] for t in torrents 
-                    if t.get('status') in ['downloading', 'magnet_conversion', 'waiting_files_selection']
-                ]
+                # Filter active torrents - handle both dict and namespace objects
+                active_torrents = []
+                for t in torrents:
+                    if hasattr(t, 'status') and hasattr(t, 'id'):
+                        if t.status in ['downloading', 'magnet_conversion', 'waiting_files_selection']:
+                            active_torrents.append(t.id)
+                    elif isinstance(t, dict):
+                        if t.get('status') in ['downloading', 'magnet_conversion', 'waiting_files_selection']:
+                            active_torrents.append(t['id'])
                 
                 # Process torrents in smaller batches with rate limiting
                 batch_size = 2  # Reduced batch size
@@ -1128,7 +1140,12 @@ class RealDebridDownloader(DownloaderBase):
                     for torrent_id in batch:
                         info = self._get_torrent_info(torrent_id)
                         if info:
-                            status = info.get('status')
+                            # Handle namespace response
+                            if hasattr(info, 'status'):
+                                status = info.status
+                            else:
+                                status = info.get('status')
+                                
                             if status in ['downloaded', 'uploading', 'magnet_conversion']:
                                 self._process_torrent_status(torrent_id, info, item)
                         
@@ -1152,7 +1169,12 @@ class RealDebridDownloader(DownloaderBase):
     def _process_torrent_status(self, torrent_id: str, info: dict, item: MediaItem):
         """Process torrent status with rate limiting awareness"""
         try:
-            status = info.get('status', 'unknown')
+            # Handle namespace response
+            if hasattr(info, 'status'):
+                status = info.status
+            else:
+                status = info.get('status')
+                
             filename = info.get('filename', 'unknown')
             progress = info.get('progress', 0)
             
@@ -1228,10 +1250,15 @@ class RealDebridDownloader(DownloaderBase):
                 if not info:
                     return DownloadCachedStreamResult(success=False, error="Failed to get torrent info")
 
-                status = info.get("status", "").lower()
-                filename = info.get("filename", "unknown")
-                progress = info.get("progress", 0)
-                speed = info.get("speed", 0) / 1024 / 1024  # Convert to MB/s
+                # Handle namespace response
+                if hasattr(info, 'status'):
+                    status = info.status
+                else:
+                    status = info.get('status')
+                    
+                filename = info.get('filename', 'unknown')
+                progress = info.get('progress', 0)
+                speed = info.get('speed', 0) / 1024 / 1024  # Convert to MB/s
                 seeders = info.get("seeders", 0)
 
                 # Log status with content name
@@ -1972,17 +1999,21 @@ class RealDebridDownloader(DownloaderBase):
         
         # Log a cleaner version with just the important info
         if response:
-            status = response.get('status', 'unknown')
+            # Handle namespace response
+            if hasattr(response, 'status'):
+                status = response.status
+            else:
+                status = response.get('status')
+                
             progress = response.get('progress', 0)
             speed = response.get('speed', 0)
-            seeders = response.get('seeders', 0)
             filename = response.get('filename', 'unknown')
             files = response.get('files', [])
             
             speed_mb = speed / 1000000 if speed else 0  # Convert to MB/s
             
             logger.debug(
-                f"📊 {self._format_progress(progress, speed_mb, seeders)}\n"
+                f"📊 {self._format_progress(progress, speed_mb, 0)}\n"
                 f"🎬 Processing file: {filename}"
             )
             
@@ -2069,7 +2100,11 @@ class RealDebridDownloader(DownloaderBase):
             - should_continue: True if download should continue, False if it should stop
             - error_message: Error message if should_continue is False, empty string otherwise
         """
-        seeders = info.get("seeders", 0)
+        # Handle namespace response
+        if hasattr(info, 'seeders'):
+            seeders = info.seeders
+        else:
+            seeders = info.get('seeders', 0)
         
         # Only check seeders during initial period
         if elapsed <= (self.SEEDER_CHECK_INTERVAL * self.MAX_SEEDER_CHECKS):
@@ -2109,7 +2144,11 @@ class RealDebridDownloader(DownloaderBase):
         for torrent_id in active_torrents:
             info = self.get_torrent_info(torrent_id)
             if info:
-                torrent_seeders[torrent_id] = info.get("seeders", 0)
+                # Handle namespace response
+                if hasattr(info, 'seeders'):
+                    torrent_seeders[torrent_id] = info.seeders
+                else:
+                    torrent_seeders[torrent_id] = info.get('seeders', 0)
             else:
                 torrent_seeders[torrent_id] = 0
                 
