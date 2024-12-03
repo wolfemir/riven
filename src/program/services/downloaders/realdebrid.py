@@ -1357,7 +1357,7 @@ class RealDebridDownloader(DownloaderBase):
     def _add_magnet_or_torrent(self, magnet: Optional[str] = None, torrent: Optional[bytes] = None, attempt: int = 1) -> TorrentAddResult:
         """Add a magnet link or torrent file to Real-Debrid with rate limit handling."""
         max_attempts = 5
-        base_backoff = 2  # Base delay in seconds
+        base_backoff = 5  # Increased base delay to 5 seconds
         
         try:
             # Check active torrents before adding
@@ -1376,30 +1376,49 @@ class RealDebridDownloader(DownloaderBase):
             # Add the magnet with rate limiting
             with self.rate_limiter:
                 logger.debug(f"🧲 Adding magnet (attempt {attempt}/{max_attempts}): {magnet[:64]}...")
-                response = self.api.request_handler.execute(
-                    HttpMethod.POST,
-                    "torrents/addMagnet",
-                    data={"magnet": magnet}
-                )
-                
-                torrent_id = response.get("id")
-                if torrent_id:
-                    logger.debug(f"✅ Successfully added torrent {torrent_id}")
-                    return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
-                else:
-                    logger.error("❌ Empty response from Real-Debrid API")
-                    return TorrentAddResult(success=False, error="Empty response from Real-Debrid API", torrent_id="", info={})
+                try:
+                    response = self.api.request_handler.execute(
+                        HttpMethod.POST,
+                        "torrents/addMagnet",
+                        data={"magnet": magnet}
+                    )
                     
-        except Exception as e:
-            backoff = min(base_backoff * (2 ** (attempt - 1)), 30)  # Cap at 30 seconds
+                    torrent_id = response.get("id")
+                    if torrent_id:
+                        logger.debug(f"✅ Successfully added torrent {torrent_id}")
+                        # Mark success to reduce backoff
+                        self.rate_limiter.mark_success()
+                        return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
+                    else:
+                        logger.error("❌ Empty response from Real-Debrid API")
+                        return TorrentAddResult(success=False, error="Empty response from Real-Debrid API", torrent_id="", info={})
             
+                except HTTPError as http_err:
+                    if http_err.response.status_code == 503:
+                        # Don't count 503 errors as rate limit failures
+                        logger.warning(f"⚠️ Real-Debrid API temporarily unavailable (503)")
+                        backoff = min(base_backoff * (2 ** (attempt - 1)), 60)  # Cap at 60 seconds for 503s
+                        if attempt < max_attempts:
+                            logger.warning(f"⏳ Service unavailable, retrying in {backoff}s... (attempt {attempt}/{max_attempts})")
+                            time.sleep(backoff)
+                            return self._add_magnet_or_torrent(magnet=magnet, torrent=torrent, attempt=attempt + 1)
+                        raise
+                    elif http_err.response.status_code == 429:  # Rate limit exceeded
+                        # Let the rate limiter handle the backoff
+                        self.rate_limiter.mark_failure()
+                        raise
+                    else:
+                        raise
+                
+        except Exception as e:
             if "Active Limit Exceeded" in str(e):
                 # Try cleanup and retry quickly
                 logger.warning(f"⚠️ Active limit exceeded, retrying cleanup...")
                 cleaned = self._cleanup_inactive_torrents()
-                if cleaned > 0:
-                    backoff = 1  # Retry quickly if we cleaned something
-                    
+                backoff = 1 if cleaned > 0 else base_backoff  # Retry quickly if we cleaned something
+            else:
+                backoff = min(base_backoff * (2 ** (attempt - 1)), 60)  # Cap at 60 seconds
+        
             if attempt < max_attempts:
                 logger.warning(f"⏳ Retrying in {backoff}s... (attempt {attempt}/{max_attempts})")
                 time.sleep(backoff)
@@ -1407,9 +1426,7 @@ class RealDebridDownloader(DownloaderBase):
             else:
                 logger.error(f"❌ Failed to add torrent after {max_attempts} attempts: {e}")
                 return TorrentAddResult(success=False, error=f"Failed to add torrent after {max_attempts} attempts: {e}", torrent_id="", info={})
-        
-        return TorrentAddResult(success=False, error="Unknown error", torrent_id="", info={})
-
+    
     def _calculate_timeout(self, info: dict, item: MediaItem) -> float:
         """Calculate download timeout based on file size and progress"""
         # Get file size in MB
@@ -2283,7 +2300,7 @@ class RealDebridDownloader(DownloaderBase):
     def _add_magnet_or_torrent(self, magnet: Optional[str] = None, torrent: Optional[bytes] = None, attempt: int = 1) -> TorrentAddResult:
         """Add a magnet or torrent to Real-Debrid with rate limit handling."""
         max_attempts = 5
-        base_backoff = 2  # Base delay in seconds
+        base_backoff = 5  # Increased base delay to 5 seconds
         
         try:
             # Check active torrents before adding
@@ -2302,30 +2319,49 @@ class RealDebridDownloader(DownloaderBase):
             # Add the magnet with rate limiting
             with self.rate_limiter:
                 logger.debug(f"🧲 Adding magnet (attempt {attempt}/{max_attempts}): {magnet[:64]}...")
-                response = self.api.request_handler.execute(
-                    HttpMethod.POST,
-                    "torrents/addMagnet",
-                    data={"magnet": magnet}
-                )
-                
-                torrent_id = response.get("id")
-                if torrent_id:
-                    logger.debug(f"✅ Successfully added torrent {torrent_id}")
-                    return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
-                else:
-                    logger.error("❌ Empty response from Real-Debrid API")
-                    return TorrentAddResult(success=False, error="Empty response from Real-Debrid API", torrent_id="", info={})
+                try:
+                    response = self.api.request_handler.execute(
+                        HttpMethod.POST,
+                        "torrents/addMagnet",
+                        data={"magnet": magnet}
+                    )
                     
-        except Exception as e:
-            backoff = min(base_backoff * (2 ** (attempt - 1)), 30)  # Cap at 30 seconds
+                    torrent_id = response.get("id")
+                    if torrent_id:
+                        logger.debug(f"✅ Successfully added torrent {torrent_id}")
+                        # Mark success to reduce backoff
+                        self.rate_limiter.mark_success()
+                        return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
+                    else:
+                        logger.error("❌ Empty response from Real-Debrid API")
+                        return TorrentAddResult(success=False, error="Empty response from Real-Debrid API", torrent_id="", info={})
             
+                except HTTPError as http_err:
+                    if http_err.response.status_code == 503:
+                        # Don't count 503 errors as rate limit failures
+                        logger.warning(f"⚠️ Real-Debrid API temporarily unavailable (503)")
+                        backoff = min(base_backoff * (2 ** (attempt - 1)), 60)  # Cap at 60 seconds for 503s
+                        if attempt < max_attempts:
+                            logger.warning(f"⏳ Service unavailable, retrying in {backoff}s... (attempt {attempt}/{max_attempts})")
+                            time.sleep(backoff)
+                            return self._add_magnet_or_torrent(magnet=magnet, torrent=torrent, attempt=attempt + 1)
+                        raise
+                    elif http_err.response.status_code == 429:  # Rate limit exceeded
+                        # Let the rate limiter handle the backoff
+                        self.rate_limiter.mark_failure()
+                        raise
+                    else:
+                        raise
+                
+        except Exception as e:
             if "Active Limit Exceeded" in str(e):
                 # Try cleanup and retry quickly
                 logger.warning(f"⚠️ Active limit exceeded, retrying cleanup...")
                 cleaned = self._cleanup_inactive_torrents()
-                if cleaned > 0:
-                    backoff = 1  # Retry quickly if we cleaned something
-                    
+                backoff = 1 if cleaned > 0 else base_backoff  # Retry quickly if we cleaned something
+            else:
+                backoff = min(base_backoff * (2 ** (attempt - 1)), 60)  # Cap at 60 seconds
+        
             if attempt < max_attempts:
                 logger.warning(f"⏳ Retrying in {backoff}s... (attempt {attempt}/{max_attempts})")
                 time.sleep(backoff)
@@ -2333,3 +2369,5 @@ class RealDebridDownloader(DownloaderBase):
             else:
                 logger.error(f"❌ Failed to add torrent after {max_attempts} attempts: {e}")
                 return TorrentAddResult(success=False, error=f"Failed to add torrent after {max_attempts} attempts: {e}", torrent_id="", info={})
+    
+    return TorrentAddResult(success=False, error="Unknown error", torrent_id="", info={})

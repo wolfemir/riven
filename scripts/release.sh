@@ -25,24 +25,74 @@ echo -e "${YELLOW}Starting release process for version ${VERSION}${NC}"
 # Ensure we're in the git repository root
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-# Generate changelog
-echo -e "${YELLOW}Generating changelog...${NC}"
-CHANGELOG=$(git log --pretty=format:"- %s" HEAD~1..HEAD)
+# Generate detailed changelog
+echo -e "${YELLOW}Generating detailed changelog...${NC}"
 
-# Create commit message with conventional commit format and changelog
+# Get all changed files
+CHANGED_FILES=$(git diff --name-only HEAD~1..HEAD)
+
+# Initialize changelog sections
+FEATURES=""
+FIXES=""
+REFACTOR=""
+DOCS=""
+OTHER=""
+
+# Process each commit and categorize changes
+while IFS= read -r commit; do
+    if [[ $commit == feat* ]]; then
+        FEATURES="${FEATURES}- ${commit#feat: }\n"
+    elif [[ $commit == fix* ]]; then
+        FIXES="${FIXES}- ${commit#fix: }\n"
+    elif [[ $commit == refactor* ]]; then
+        REFACTOR="${REFACTOR}- ${commit#refactor: }\n"
+    elif [[ $commit == docs* ]]; then
+        DOCS="${DOCS}- ${commit#docs: }\n"
+    else
+        OTHER="${OTHER}- ${commit}\n"
+    fi
+done < <(git log --pretty=format:"%s" HEAD~1..HEAD)
+
+# Build the changelog with sections
+CHANGELOG="### 🚀 Features\n"
+[[ -n "$FEATURES" ]] && CHANGELOG+="$FEATURES\n" || CHANGELOG+="No new features\n\n"
+
+CHANGELOG+="### 🐛 Bug Fixes\n"
+[[ -n "$FIXES" ]] && CHANGELOG+="$FIXES\n" || CHANGELOG+="No bug fixes\n\n"
+
+CHANGELOG+="### ♻️ Refactoring\n"
+[[ -n "$REFACTOR" ]] && CHANGELOG+="$REFACTOR\n" || CHANGELOG+="No refactoring changes\n\n"
+
+CHANGELOG+="### 📚 Documentation\n"
+[[ -n "$DOCS" ]] && CHANGELOG+="$DOCS\n" || CHANGELOG+="No documentation changes\n\n"
+
+[[ -n "$OTHER" ]] && CHANGELOG+="### 🔄 Other Changes\n$OTHER\n"
+
+# Add file changes section
+CHANGELOG+="\n### 📁 Modified Files\n"
+while IFS= read -r file; do
+    CHANGELOG+="- \`$file\`\n"
+done <<< "$CHANGED_FILES"
+
+# Create commit message with conventional commit format and detailed changelog
 COMMIT_MSG="feat(release): version ${VERSION}
 
-This release includes various improvements and bug fixes:
+🎉 Release Notes for version ${VERSION}
 
 ${CHANGELOG}
 
-BREAKING CHANGE: None"
+### 💥 Breaking Changes
+- None
+
+### 🔍 Additional Notes
+- Docker image: ${DOCKER_REPO}:${VERSION}
+- Previous version: ${LATEST_TAG}"
 
 # Stage all changes
 git add .
 
 # Commit with changelog
-echo -e "${YELLOW}Committing changes...${NC}"
+echo -e "${YELLOW}Committing changes with detailed changelog...${NC}"
 git commit -m "$COMMIT_MSG"
 
 # Push changes to branch
