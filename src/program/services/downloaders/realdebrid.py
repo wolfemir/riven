@@ -143,6 +143,13 @@ class DownloadManager:
             if self.active_downloads == 0:
                 self._download_complete.set()
 
+class TorrentAddResult(BaseModel):
+    """Result of adding a torrent"""
+    torrent_id: str
+    info: Dict
+    success: bool
+    error: Optional[str]
+
 class RealDebridDownloader(DownloaderBase):
     """Main Real-Debrid downloader class implementing DownloaderBase"""
     MAX_RETRIES = 3
@@ -162,9 +169,18 @@ class RealDebridDownloader(DownloaderBase):
     CLEANUP_INACTIVE_TIME = 300  # 5 minutes of inactivity
     MAX_CONCURRENT_TOTAL = 9  # Increased from 5 to 9
     MAX_CONCURRENT_PER_CONTENT = 4  # Increased from 2 to 4
+    MAX_CONCURRENT_CONTENT = 5  # Maximum number of different content items downloading at once
     STATUS_CHECK_INTERVAL = 5  # seconds
     QUEUE_TIMEOUT = 30  # seconds
     MAX_ZERO_SEEDER_CHECKS = 2  # Maximum number of zero seeder checks
+    MAX_PARALLEL_TORRENTS = 5  # Maximum number of parallel torrents to try
+    INITIAL_CHECK_DELAY = 5  # Initial delay before checking each torrent status
+    TORRENT_ADD_INTERVAL = 5  # Wait time between adding torrents
+    PARALLEL_CHECK_INTERVAL = 15  # Check interval for all active torrents
+    RATE_LIMIT_BACKOFF_BASE = 2.0  # Base for exponential backoff
+    RATE_LIMIT_INITIAL_DELAY = 5.0  # Initial delay in seconds
+    RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay in seconds
+    RATE_LIMIT_MAX_RETRIES = 5  # Maximum number of retries for rate limited requests
 
     def __init__(self, api: RealDebridAPI):
         """Initialize Real-Debrid downloader with thread-safe components"""
@@ -578,9 +594,12 @@ class RealDebridDownloader(DownloaderBase):
         # Process all video files
         valid_videos = []
         
+        # Log what extensions we're looking for
+        logger.debug(f"Looking for files with extensions: {VIDEO_EXTENSIONS}")
+        
         for file in files:
             path = file.get("path", "")
-            name = path.lower()
+            name = path.split("/")[-1] if path else ""
             size = file.get("bytes", 0)
             file_id = str(file.get("id", ""))
             
@@ -594,7 +613,11 @@ class RealDebridDownloader(DownloaderBase):
                 logger.debug(f"⏭️ Skipped sample file: {name}")
                 continue
             
-            if any(name.endswith(f".{ext}") for ext in VIDEO_EXTENSIONS):
+            # Extract extension and check if it's a video file
+            extension = name.split(".")[-1].lower() if "." in name else ""
+            is_video = extension in VIDEO_EXTENSIONS
+            
+            if is_video:
                 # For shows, check if this file matches the requested episode
                 if item and hasattr(item, 'type') and item.type == "episode":
                     # Parse episode info from filename
@@ -608,16 +631,20 @@ class RealDebridDownloader(DownloaderBase):
                             else:
                                 logger.debug(f"❌ Episode numbers don't match: {name} vs S{item.parent.number:02d}E{item.number:02d}")
                         else:
-                            logger.debug(f"❌ Could not parse episode info from: {name}")
+                            # If we can't parse episode info but it's a video file, include it
+                            valid_videos.append(file)
+                            logger.debug(f"⚠️ Could not parse episode info but including video file: {name}")
                     except Exception as e:
-                        logger.debug(f"⚠️ Error parsing episode info from {name}: {e}")
+                        # If parsing fails but it's a video file, include it
+                        valid_videos.append(file)
+                        logger.debug(f"⚠️ Error parsing episode info but including video file {name}: {e}")
                 else:
                     # For movies or when no item is provided, include all video files
                     valid_videos.append(file)
                     logger.debug(f"✅ Found valid video file: {name} (size: {self._format_size(size)}, id: {file_id})")
             else:
                 # Log why file was rejected
-                logger.debug(f"❌ Skipped non-video file: {name}")
+                logger.debug(f"❌ Skipped non-video file: {name} (extension: {extension})")
 
         # Sort videos by size (largest first) to ensure main episodes/movies are prioritized
         valid_videos.sort(key=lambda x: x.get("bytes", 0), reverse=True)
@@ -643,7 +670,11 @@ class RealDebridDownloader(DownloaderBase):
             # Log all files for debugging
             logger.debug("❌ No valid video files found. Available files:")
             for file in files:
-                logger.debug(f"  • {file.get('path', '')} ({self._format_size(file.get('bytes', 0))})")
+                path = file.get("path", "")
+                name = path.split("/")[-1] if path else ""
+                size = file.get("bytes", 0)
+                extension = name.split(".")[-1].lower() if "." in name else ""
+                logger.debug(f"  • {path} (size: {self._format_size(size)}, extension: {extension})")
         else:
             logger.debug(f"✨ Selected {len(result)} video files for download")
 
@@ -664,72 +695,187 @@ class RealDebridDownloader(DownloaderBase):
                 logger.error("No files to select")
                 return False
 
+            # Log what we're about to select
+            logger.debug(f"📑 Selecting files for torrent {self._color_text(torrent_id, 'cyan')}:")
+            logger.debug(f"  • File IDs: {file_ids}")
+            
+            # Get current torrent info for comparison
+            before_info = self._get_torrent_info(torrent_id)
+            if before_info:
+                logger.debug(f"  • Current status: {self._format_status(before_info.get('status', 'unknown'))}")
+
             data = {"files": ",".join(file_ids)}
             self.api.request_handler.execute(HttpMethod.POST, f"torrents/selectFiles/{torrent_id}", data=data)
+            
+            # Get updated torrent info
+            after_info = self._get_torrent_info(torrent_id)
+            if after_info:
+                logger.debug(f"  • New status: {self._format_status(after_info.get('status', 'unknown'))}")
+            
+            logger.debug(f"✅ Successfully selected {len(file_ids)} files")
             return True
+            
         except Exception as e:
-            logger.error(f"Failed to select files: {e}")
+            logger.error(f"❌ Failed to select files: {e}")
             return False
 
     def download_cached_stream(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
-        """Download a stream from Real-Debrid"""
-        try:
-            # Do a single thorough cleanup before starting new download
-            exclude_ids = {stream.id} if hasattr(stream, 'id') else set()
-            if not self._cleanup_all_except(exclude_ids):
-                logger.warning("Initial cleanup failed, but continuing with download")
+        """Download a stream from Real-Debrid with sequential parallel checking"""
+        content_id = item.id if item else None
 
-            # Check if we can start a new download
-            if not self._can_start_download(item.id):
-                return DownloadCachedStreamResult(
-                    success=False,
-                    error="Too many concurrent downloads"
-                )
-
-            # Add the torrent to Real-Debrid
-            torrent_info = self._add_magnet_or_torrent(stream)
-            if not torrent_info:
-                return DownloadCachedStreamResult(
-                    success=False,
-                    error="Failed to add torrent"
-                )
-
-            torrent_id = torrent_info['id']
-            self._add_active_download(item.id, torrent_id)
-
-            try:
-                # Process available files and select the ones to download
-                files = torrent_info.get('files', [])
-                valid_files = self._process_files(files, item)
-                if not valid_files:
-                    logger.error("No valid video files found in torrent")
-                    return DownloadCachedStreamResult(
-                        success=False,
-                        error="No valid video files found"
-                    )
-
-                # Select the files to download
-                file_ids = list(valid_files.keys())
-                if not self.select_files(torrent_id, file_ids):
-                    return DownloadCachedStreamResult(
-                        success=False,
-                        error="Failed to select files"
-                    )
-
-                # Wait for download to complete
-                download_result = self.wait_for_download(torrent_id, item.id, item, stream)
-                return download_result
-
-            finally:
-                # Always remove from active downloads
-                self._remove_active_download(item.id, torrent_id)
-
-        except Exception as e:
-            logger.error(f"Error downloading stream: {e}")
+        # Check if we can start a new download
+        if not self._can_start_download(content_id):
             return DownloadCachedStreamResult(
                 success=False,
-                error=str(e)
+                error=f"Cannot start new download - content limit reached"
             )
+
+        active_torrents = {}  # Track active torrents and their info
+        alternative_streams = self._get_alternative_streams(item, stream, max_count=self.MAX_PARALLEL_TORRENTS-1)
+        
+        def add_and_check_torrent(stream_to_add):
+            """Add a torrent and check its initial status"""
+            result = self.add_torrent(stream_to_add)
+            if not result or not result.torrent_id:
+                return None
+                
+            torrent_id = result.torrent_id
+            active_torrents[torrent_id] = {
+                'stream': stream_to_add,
+                'content_name': item.name if item else "Unknown",
+                'added_time': time.time(),
+            }
+            
+            logger.debug(f"🚀 Added torrent {self._color_text(torrent_id, 'cyan')}")
+            
+            # Wait initial delay
+            time.sleep(self.INITIAL_CHECK_DELAY)
+            
+            # Check torrent status
+            info = self._get_torrent_info(torrent_id)
+            if info and info.get('status') == RDTorrentStatus.DOWNLOADED.value:
+                logger.debug(f"✨ Torrent {self._color_text(torrent_id, 'green')} is ready for download")
+                return torrent_id
+            
+            return None
+        
+        # Step 1: Try initial torrent
+        logger.debug(f"📥 Trying initial torrent...")
+        downloaded_id = add_and_check_torrent(stream)
+        if downloaded_id:
+            return self.wait_for_download(downloaded_id, content_id, item, stream)
+        
+        # Step 2: Try alternative torrents sequentially
+        for idx, alt_stream in enumerate(alternative_streams, 1):
+            if len(active_torrents) >= self.MAX_PARALLEL_TORRENTS:
+                break
+                
+            logger.debug(f"📥 Trying alternative torrent {idx}/{len(alternative_streams)}...")
+            downloaded_id = add_and_check_torrent(alt_stream)
+            if downloaded_id:
+                # Clean up other torrents
+                for other_id in list(active_torrents.keys()):
+                    if other_id != downloaded_id:
+                        self.delete_torrent(other_id)
+                return self.wait_for_download(downloaded_id, content_id, item, alt_stream)
+            
+            # Wait before adding next torrent
+            if idx < len(alternative_streams):
+                time.sleep(self.TORRENT_ADD_INTERVAL)
+        
+        # Step 3: Monitor all torrents
+        start_time = time.time()
+        last_check_time = 0
+        best_torrent = None
+        best_seeders = -1
+        
+        while active_torrents:
+            current_time = time.time()
+            
+            # Check all torrents every PARALLEL_CHECK_INTERVAL seconds
+            if current_time - last_check_time < self.PARALLEL_CHECK_INTERVAL:
+                time.sleep(1)
+                continue
+                
+            last_check_time = current_time
+            logger.debug(f"🔍 Checking {len(active_torrents)} active torrents...")
+            
+            status_summary = []
+            for torrent_id, data in list(active_torrents.items()):
+                info = self._get_torrent_info(torrent_id)
+                if not info:
+                    continue
+                    
+                status = info.get('status', 'unknown')
+                seeders = info.get('seeders', 0)
+                speed = info.get('speed', 0)
+                progress = info.get('progress', 0)
+                content_name = data.get('content_name', 'Unknown')
+                
+                # Format speed nicely
+                speed_str = f"{speed/1024/1024:.1f}MB/s" if speed > 1024*1024 else f"{speed/1024:.1f}KB/s" if speed > 0 else "0KB/s"
+                
+                # Add status details
+                status_details = f"[{self._color_text(content_name, 'yellow')}] "
+                status_details += f"{status} ({progress:.1f}%) "
+                status_details += f"🌱{seeders} "  # Seeders with plant emoji
+                status_details += f"⚡{speed_str}"  # Speed with lightning emoji
+                status_summary.append(status_details)
+            
+            if status_summary:
+                logger.debug("Torrent Status:\n" + "\n".join(f"  • {s}" for s in status_summary))
+            
+            for torrent_id, data in list(active_torrents.items()):
+                info = self._get_torrent_info(torrent_id)
+                if not info:
+                    continue
+                    
+                status = info.get('status', 'unknown')
+                seeders = info.get('seeders', 0)
+                
+                # Found a downloaded torrent
+                if status == RDTorrentStatus.DOWNLOADED.value:
+                    logger.debug(f"✅ Found downloaded torrent {self._color_text(torrent_id, 'green')}")
+                    
+                    # Clean up other torrents
+                    for other_id in list(active_torrents.keys()):
+                        if other_id != torrent_id:
+                            self.delete_torrent(other_id)
+                            
+                    return self.wait_for_download(torrent_id, content_id, item, data['stream'])
+                
+                # Track best seeder count
+                if seeders > best_seeders:
+                    best_seeders = seeders
+                    best_torrent = (torrent_id, data)
+                    logger.debug(f"⭐ New best torrent {self._color_text(torrent_id, 'yellow')} with {seeders} seeders")
+                    
+                    # Clean up torrents with fewer seeders
+                    for other_id, other_data in list(active_torrents.items()):
+                        if other_id != torrent_id:
+                            other_info = self._get_torrent_info(other_id)
+                            if other_info and other_info.get('seeders', 0) < seeders:
+                                logger.debug(f"🗑️ Removing torrent {self._color_text(other_id, 'red')} with fewer seeders ({other_info.get('seeders', 0)} < {seeders})")
+                                self.delete_torrent(other_id)
+                                del active_torrents[other_id]
+                
+                # Remove dead torrents
+                if status in [RDTorrentStatus.MAGNET_ERROR.value, RDTorrentStatus.ERROR.value, RDTorrentStatus.DEAD.value]:
+                    logger.debug(f"❌ Removing dead torrent {self._color_text(torrent_id, 'red')}")
+                    del active_torrents[torrent_id]
+                    self.delete_torrent(torrent_id)
+            
+            # If we have a best torrent, keep only that one
+            if best_torrent and len(active_torrents) > 1:
+                best_id, _ = best_torrent
+                for other_id in list(active_torrents.keys()):
+                    if other_id != best_id:
+                        logger.debug(f"🗑️ Removing non-best torrent {self._color_text(other_id, 'red')}")
+                        self.delete_torrent(other_id)
+                        del active_torrents[other_id]
+        
+        # If we get here, no torrent succeeded
+        return DownloadCachedStreamResult(success=False, error="No torrents downloaded successfully")
 
     def _get_retry_hours(self, scrape_times: int) -> float:
         """Get retry hours based on number of scrape attempts."""
@@ -943,55 +1089,776 @@ class RealDebridDownloader(DownloaderBase):
             }]
         return result
 
-    def add_torrent(self, stream: Stream, attempt: int = 1) -> Optional[Dict]:
-        """Add a torrent to Real-Debrid and return the torrent info"""
-        if attempt > 5:
-            logger.error(f"Failed to add torrent {stream.id} after {attempt-1} attempts")
-            return None
+    def add_torrent(self, stream: Stream) -> TorrentAddResult:
+        """Add a torrent to Real-Debrid and select files"""
+        try:
+            # Construct magnet link from infohash
+            magnet = f"magnet:?xt=urn:btih:{stream.infohash}"
+            
+            # Add the torrent
+            result = self._add_magnet_or_torrent(magnet=magnet)
+            if not result.success:
+                return result  # Already a TorrentAddResult object
+
+            # Get torrent info
+            torrent_info = self._get_torrent_info(result.torrent_id)
+            if not torrent_info:
+                return TorrentAddResult(success=False, error="Failed to get torrent info",
+                                      torrent_id=result.torrent_id, info={})
+
+            # Select files
+            file_ids = self._get_media_file_ids(torrent_info)
+            if not file_ids:
+                return TorrentAddResult(success=False, error="No valid media files found",
+                                      torrent_id=result.torrent_id, info=torrent_info)
+
+            if not self.select_files(result.torrent_id, file_ids):
+                return TorrentAddResult(success=False, error="Failed to select files",
+                                      torrent_id=result.torrent_id, info=torrent_info)
+
+            return TorrentAddResult(success=True, error=None,
+                                  torrent_id=result.torrent_id, info=torrent_info)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error adding torrent: {error_msg}")
+            return TorrentAddResult(success=False, error=error_msg,
+                                  torrent_id="", info={})
+
+    def _get_alternative_streams(self, item: MediaItem, current_stream: Stream, max_count: int = 4) -> List[Stream]:
+        """Get alternative streams for the same content, excluding the current stream"""
+        alternatives = []
+        try:
+            # Get all available streams for the item
+            all_streams = item.streams
+            if not all_streams:
+                return []
+
+            # Filter and sort by seeders
+            for stream in all_streams:
+                if stream.infohash != current_stream.infohash:
+                    alternatives.append(stream)
+                    
+            # Sort by seeder count if available
+            alternatives.sort(key=lambda x: getattr(x, 'seeders', 0), reverse=True)
+            
+            return alternatives[:max_count]
+        except Exception as e:
+            logger.error(f"Error getting alternative streams: {e}")
+            return []
+
+    def _add_magnet_or_torrent(self, magnet: Optional[str] = None, torrent: Optional[bytes] = None) -> TorrentAddResult:
+        """Add a magnet link or torrent file to Real-Debrid with rate limit handling."""
+        try:
+            # Log what we're trying to add
+            if magnet:
+                logger.debug(f"🧲 Adding magnet: {magnet[:60]}...")
+            else:
+                logger.debug("📁 Adding torrent file")
+            
+            # Prepare request data
+            data = {}
+            files = {}
+            
+            if magnet:
+                data["magnet"] = magnet
+            elif torrent:
+                files = {"files[]": ("file.torrent", torrent)}
+            
+            # Make API request
+            response = self.api.request_handler.execute(
+                HttpMethod.POST, 
+                "torrents/addMagnet" if magnet else "torrents/addTorrent",
+                data=data,
+                files=files
+            )
+            
+            # Log response details
+            if response:
+                torrent_id = response.get("id")
+                logger.debug(f"✅ Successfully added torrent {self._color_text(torrent_id, 'green')}")
+                return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
+            else:
+                logger.error("❌ Empty response from Real-Debrid API")
+                return TorrentAddResult(success=False, error="Empty API response", torrent_id="", info={})
+                
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"❌ Failed to add torrent: {error_msg}")
+            return TorrentAddResult(success=False, error=error_msg, torrent_id="", info={})
+
+    def _calculate_timeout(self, info: dict, item: MediaItem) -> float:
+        """Calculate download timeout based on file size and progress"""
+        # Get file size in MB
+        file_size_mb = info.get("bytes", 0) / (1024 * 1024)  # Convert to MB
+        
+        # Calculate size-based timeout (10 seconds per 50MB)
+        size_based_timeout = (file_size_mb / 50) * self.TIMEOUT_PER_50MB
+        
+        # Calculate final timeout with base and max limits
+        timeout = min(
+            self.BASE_TIMEOUT + size_based_timeout,
+            self.MAX_TIMEOUT
+        )
+        
+        # Log timeout calculation details
+        logger.debug(
+            f"Timeout calculation:\n"
+            f"  File size: {file_size_mb:.1f}MB\n"
+            f"  Base timeout: {self.BASE_TIMEOUT}s\n"
+            f"  Size-based addition: {size_based_timeout:.1f}s\n"
+            f"  Final timeout: {timeout:.1f}s"
+        )
+        
+        return timeout
+
+    def _color_text(self, text: str, color: str) -> str:
+        """Add ANSI color to text"""
+        colors = {
+            'red': '\033[91m',
+            'green': '\033[92m',
+            'yellow': '\033[93m',
+            'blue': '\033[94m',
+            'magenta': '\033[95m',
+            'cyan': '\033[96m',
+            'white': '\033[97m',
+            'reset': '\033[0m'
+        }
+        return f"{colors.get(color, '')}{text}{colors['reset']}"
+
+    def _format_status(self, status: str) -> str:
+        """Format status with color"""
+        status = status.upper()
+        color_map = {
+            'DOWNLOADED': 'green',
+            'DOWNLOADING': 'blue',
+            'QUEUED': 'yellow',
+            'WAITING_FILES_SELECTION': 'cyan',
+            'ERROR': 'red',
+            'MAGNET_ERROR': 'red',
+            'DEAD': 'red'
+        }
+        return self._color_text(status, color_map.get(status.lower(), 'white'))
+
+    def _format_progress(self, progress: float, speed: float, seeders: int) -> str:
+        """Format progress info with colors"""
+        progress_color = 'green' if progress >= 90 else 'yellow' if progress >= 50 else 'blue'
+        speed_color = 'green' if speed > 5 else 'yellow' if speed > 1 else 'blue'
+        seeders_color = 'green' if seeders > 10 else 'yellow' if seeders > 0 else 'red'
+        
+        return (
+            f"Progress: {self._color_text(f'{progress:.1f}%', progress_color)}, "
+            f"Speed: {self._color_text(f'{speed:.2f}MB/s', speed_color)}, "
+            f"Seeders: {self._color_text(str(seeders), seeders_color)}"
+        )
+
+    def _format_count(self, current: int, limit: int) -> str:
+        """Format count with color based on how close to limit"""
+        color = 'green' if current < limit * 0.7 else 'yellow' if current < limit * 0.9 else 'red'
+        return self._color_text(f"{current}/{limit}", color)
+
+    def _format_attempt(self, attempt: int, max_attempts: int) -> str:
+        """Format attempt counter with color"""
+        color = 'green' if attempt <= max_attempts/2 else 'yellow' if attempt <= max_attempts*0.8 else 'red'
+        return self._color_text(f"attempt {attempt}/{max_attempts}", color)
+
+    def _format_deletion(self, reason: str) -> str:
+        """Format deletion message"""
+        return self._color_text(f"🗑️ {reason}", 'red')
+
+    def _cleanup_all_except(self, exclude_ids: Set[str] = None) -> bool:
+        """Clean up all non-downloaded torrents except those in exclude_ids"""
+        exclude_ids = exclude_ids or set()
+        cleaned_ids = set()
 
         try:
-            # Check if we're at the active torrent limit
-            if not self._can_start_download():
-                logger.debug(f"🧹 Active limit exceeded, forcing cleanup (attempt {attempt}/5)")
-                if not self._cleanup_if_needed():
-                    return None
-                return self.add_torrent(stream, attempt + 1)
+            # Get all torrents with retries
+            max_retries = 3
+            retry_count = 0
+            torrents = None
 
-            # Add the magnet/torrent
-            if stream.magnet:
-                response = self.api.request_handler.execute(HttpMethod.POST, "torrents/addMagnet", data={"magnet": stream.magnet})
+            while retry_count < max_retries:
+                try:
+                    torrents = self._api_request_with_backoff(
+                        HttpMethod.GET,
+                        "torrents",
+                        max_attempts=5
+                    )
+                    if isinstance(torrents, list):
+                        break
+                    retry_count += 1
+                    time.sleep(5)
+                except Exception as e:
+                    logger.warning(f"Failed to get torrents (attempt {retry_count + 1}/{max_retries}): {e}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        time.sleep(5)
+
+            if not isinstance(torrents, list):
+                logger.error(f"Invalid response from torrents endpoint after {max_retries} attempts")
+                return False
+
+            # First check active torrent count
+            try:
+                active_count = self.api.request_handler.execute(HttpMethod.GET, "torrents/activeCount")
+                logger.debug(f"⚠️ At active torrent limit {self._format_count(active_count['nb'], active_count['limit'])}")
+                if active_count["nb"] < active_count["limit"]:
+                    return 0
+                
+                # Calculate how aggressive we should be based on how far over the limit we are
+                overage = active_count["nb"] - active_count["limit"]
+                logger.warning(f"Over active torrent limit by {overage} torrents")
+                # If we're over by more than 5, be extremely aggressive
+                extremely_aggressive = overage >= 5
+                # If we're over by any amount, be somewhat aggressive
+                aggressive_cleanup = overage > 0
+            except Exception as e:
+                logger.warning(f"Failed to get active torrent count: {e}")
+                extremely_aggressive = True  # Be extremely aggressive if we can't check
+                aggressive_cleanup = True
+            
+            # Get list of all torrents
+            torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
+            to_delete = []  # List of (priority, torrent_id, reason) tuples
+            cleaned = 0
+            
+            # Count active torrents by status and collect stats
+            active_by_status = defaultdict(list)
+            magnet_times = []  # Track magnet conversion times
+            downloading_stats = []  # Track download stats
+            total_active = 0
+            
+            # Track duplicates by filename
+            filename_to_torrents = defaultdict(list)
+            
+            for torrent in torrents:
+                status = torrent.get("status", "")
+                if self._is_active_status(status):
+                    # Calculate time_elapsed first
+                    time_elapsed = 0
+                    try:
+                        added = torrent.get("added", "")
+                        if added:
+                            # Convert to UTC, then to local time
+                            added_time = datetime.fromisoformat(added.replace("Z", "+00:00"))
+                            added_time = added_time.astimezone().replace(tzinfo=None)
+                            time_elapsed = (current_time - added_time).total_seconds()
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid timestamp format for torrent: {torrent.get('added')}")
+                    
+                    torrent_stats = {
+                        "status": status,
+                        "filename": torrent.get("filename", "unknown"),
+                        "progress": torrent.get("progress", 0),
+                        "speed": torrent.get("speed", 0),
+                        "seeders": torrent.get("seeders", 0),
+                        "time_elapsed": time_elapsed,
+                        "id": torrent.get("id", "")
+                    }
+                    
+                    active_by_status[status].append(torrent_stats)
+                    filename_to_torrents[torrent_stats["filename"]].append(torrent_stats)
+                    total_active += 1
+                    
+                    if status == "magnet_conversion" and time_elapsed > 0:
+                        magnet_times.append(time_elapsed)
+                    elif status == "downloading":
+                        downloading_stats.append(torrent_stats)
+            
+            # First handle duplicates - keep only the most progressed version of each file
+            for filename, dupes in filename_to_torrents.items():
+                if len(dupes) > 1:
+                    logger.info(f"Found {len(dupes)} duplicates of {filename}")
+                    # Sort by progress (highest first), then by speed (highest first)
+                    dupes.sort(key=lambda x: (x["progress"], x["speed"]), reverse=True)
+                    
+                    # Keep the best one, mark others for deletion
+                    best = dupes[0]
+                    logger.info(f"Keeping best duplicate: {best['progress']}% @ {best['speed']/1024:.1f} KB/s")
+                    
+                    for dupe in dupes[1:]:
+                        reason = (f"duplicate of {filename} "
+                                f"(keeping: {best['progress']}% @ {best['speed']/1024:.1f} KB/s, "
+                                f"removing: {dupe['progress']}% @ {dupe['speed']/1024:.1f} KB/s)")
+                        to_delete.append((150, dupe["id"], reason, dupe["time_elapsed"]))  # Highest priority for duplicates
+                        logger.info(f"Marking duplicate for deletion: {reason}")
+            
+            # Find stalled or problematic torrents
+            stalled_threshold = 60  # 1 minute without progress
+            near_complete_threshold = 95.0  # Protect torrents above this %
+            min_speed_threshold = 100 * 1024  # 100 KB/s minimum speed
+            
+            for status, torrents in active_by_status.items():
+                for t in torrents:
+                    # Skip nearly complete downloads unless they're completely stalled
+                    if t["progress"] >= near_complete_threshold:
+                        if t["speed"] == 0:
+                            logger.warning(f"Nearly complete torrent stalled: {t['filename']} at {t['progress']}%")
+                            reason = f"stalled at {t['progress']}% complete (no speed for {t['time_elapsed']/60:.1f}m)"
+                            to_delete.append((90, t["id"], reason, t["time_elapsed"]))
+                        continue
+                    
+                    # Check for stalled downloads
+                    if status == "downloading":
+                        if t["speed"] < min_speed_threshold:
+                            time_stalled = t["time_elapsed"]
+                            if time_stalled > stalled_threshold:
+                                reason = (f"stalled download: {t['filename']} "
+                                        f"(progress: {t['progress']}%, "
+                                        f"speed: {t['speed']/1024:.1f} KB/s, "
+                                        f"stalled for: {time_stalled/60:.1f}m)")
+                                priority = 120 if t["progress"] < 10 else 100  # Higher priority for early stalls
+                                to_delete.append((priority, t["id"], reason, time_stalled))
+                                logger.info(f"Marking stalled download for deletion: {reason}")
+                    
+                    # Handle stuck magnet conversions more aggressively
+                    elif status == "magnet_conversion":
+                        if t["time_elapsed"] > 300:  # 5 minutes
+                            reason = f"stuck in magnet conversion for {t['time_elapsed']/60:.1f} minutes"
+                            to_delete.append((130, t["id"], reason, t["time_elapsed"]))
+                            logger.info(f"Marking stuck magnet for deletion: {reason}")
+            
+            # Log active torrent distribution and detailed stats
+            logger.info("=== Active Torrent Stats ===")
+            for status, active_torrents in active_by_status.items():
+                count = len(active_torrents)
+                logger.info(f"\n{status.upper()} ({count} torrents):")
+                
+                # Sort by time elapsed
+                active_torrents.sort(key=lambda x: x["time_elapsed"], reverse=True)
+                
+                for t in active_torrents:
+                    stats = []
+                    if t["progress"] > 0:
+                        stats.append(f"progress: {t['progress']}%")
+                    if t["speed"] > 0:
+                        stats.append(f"speed: {t['speed']/1024:.1f} KB/s")
+                    if t["seeders"] > 0:
+                        stats.append(f"seeders: {t['seeders']}")
+                    if t["time_elapsed"] > 0:
+                        stats.append(f"age: {t['time_elapsed']/60:.1f}m")
+                    
+                    stats_str = ", ".join(stats) if stats else f"age: {t['time_elapsed']/60:.1f}m"
+                    logger.info(f"  - {t['filename']} ({stats_str})")
+            
+            # Calculate duplicate ratio and adjust aggressiveness
+            unique_filenames = set()
+            for status, torrents in active_by_status.items():
+                for t in torrents:
+                    unique_filenames.add(t["filename"])
+            
+            duplicate_ratio = (total_active - len(unique_filenames)) / total_active if total_active > 0 else 0
+            if duplicate_ratio > 0.5:  # If more than 50% are duplicates
+                extremely_aggressive = True
+                logger.info(f"High duplicate ratio ({duplicate_ratio:.1%}), using extremely aggressive cleanup")
+            
+            # Set base thresholds
+            if extremely_aggressive:
+                magnet_threshold = 30  # 30 seconds
+                time_threshold = self.CLEANUP_INACTIVE_TIME / 4
+            elif aggressive_cleanup:
+                magnet_threshold = 60  # 1 minute
+                time_threshold = self.CLEANUP_INACTIVE_TIME / 2
             else:
-                response = self.api.request_handler.execute(HttpMethod.PUT, "torrents/addTorrent", data=stream.torrent)
-
-            if not response or not isinstance(response, dict):
-                logger.error(f"Invalid response adding torrent {stream.id}: {response}")
-                return None
-
-            torrent_id = response.get("id")
-            if not torrent_id:
-                logger.error(f"No torrent ID in response: {response}")
-                return None
-
-            # Get info about the torrent
-            info = self.api.request_handler.execute(HttpMethod.GET, f"torrents/info/{torrent_id}")
-            if not info or not isinstance(info, dict):
-                logger.error(f"Invalid info response for torrent {torrent_id}: {info}")
-                return None
-
-            return info
-
-        except RealDebridError as e:
-            if "rate limit exceeded" in str(e).lower():
-                # Add exponential backoff for rate limits
-                wait_time = max(2, min(2 ** attempt, 30))  # Minimum 2 second wait, then exponential backoff up to 30 seconds
-                logger.warning(f"Rate limit hit, waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-                return self.add_torrent(stream, attempt + 1)
-            logger.error(f"Failed to add torrent {stream.id} after {attempt} attempts: {e}")
-            return None
+                magnet_threshold = 300  # 5 minutes
+                time_threshold = self.CLEANUP_INACTIVE_TIME
+            
+            logger.debug(f"⏱️ Using thresholds - Magnet: {self._color_text(f'{magnet_threshold/60:.1f}m', 'cyan')}, General: {self._color_text(f'{time_threshold/60:.1f}m', 'cyan')}")
+            
+            # Process all torrents for cleanup
+            for status, torrents in active_by_status.items():
+                for torrent_stats in torrents:
+                    should_delete = False
+                    reason = ""
+                    priority = 0
+                    time_elapsed = torrent_stats["time_elapsed"]
+                    
+                    # 1. Error states (highest priority)
+                    if status in ("error", "magnet_error", "virus", "dead"):
+                        should_delete = True
+                        reason = f"error status: {status}"
+                        priority = 100
+                    
+                    # 2. Magnet conversion (high priority if taking too long)
+                    elif status == "magnet_conversion":
+                        if time_elapsed > magnet_threshold:
+                            should_delete = True
+                            reason = f"stuck in magnet conversion for {time_elapsed/60:.1f} minutes"
+                            priority = 95  # Very high priority since we have so many
+                    
+                    # 3. Stalled or slow downloads
+                    elif status == "downloading":
+                        progress = torrent_stats["progress"]
+                        speed = torrent_stats["speed"]
+                        seeders = torrent_stats["seeders"]
+                        
+                        if progress == 0 and time_elapsed > time_threshold:
+                            should_delete = True
+                            reason = f"no progress after {time_elapsed/60:.1f} minutes"
+                            priority = 85
+                        elif progress < self.CLEANUP_MINIMAL_PROGRESS_THRESHOLD and time_elapsed > time_threshold:
+                            should_delete = True
+                            reason = f"minimal progress ({progress}%) after {time_elapsed/60:.1f} minutes"
+                            priority = 80
+                        elif speed < self.CLEANUP_SPEED_THRESHOLD:
+                            should_delete = True
+                            reason = f"slow speed ({speed/1024:.1f} KB/s)"
+                            priority = 75
+                        elif seeders == 0:
+                            should_delete = True
+                            reason = f"no seeders"
+                            priority = 85
+                    
+                    # 4. Stuck uploads/compression
+                    elif status in ("uploading", "compressing"):
+                        speed = torrent_stats["speed"]
+                        if time_elapsed > time_threshold or speed < self.CLEANUP_SPEED_THRESHOLD:
+                            should_delete = True
+                            reason = f"stuck in {status} for {time_elapsed/60:.1f} minutes"
+                            priority = 60
+                    
+                    # 5. Other states
+                    elif status in ("waiting_files_selection", "queued"):
+                        if time_elapsed > time_threshold:
+                            should_delete = True
+                            reason = f"stuck in {status} for {time_elapsed/60:.1f} minutes"
+                            priority = 50
+                    
+                    if should_delete:
+                        filename = torrent_stats["filename"]
+                        progress = torrent_stats["progress"]
+                        speed = torrent_stats["speed"]
+                        full_reason = f"{reason} (file: {filename}, progress: {progress}%, speed: {speed/1024:.1f} KB/s)"
+                        to_delete.append((priority, torrent_stats["id"], full_reason, time_elapsed))
+            
+            # Sort by priority (highest first) and extract torrent_id and reason
+            to_delete.sort(reverse=True)
+            
+            # If we're extremely aggressive, take more torrents
+            batch_size = self.CLEANUP_BATCH_SIZE * 2 if extremely_aggressive else self.CLEANUP_BATCH_SIZE
+            
+            # If no torrents were marked for deletion but we're still over limit,
+            # force delete the slowest/least progressed torrents
+            if not to_delete and total_active > active_count["limit"]:
+                logger.info("No torrents met deletion criteria but still over limit, using fallback cleanup")
+                
+                # First try to clean up just duplicates
+                duplicates_only = True
+                cleanup_attempts = 2  # Try duplicates first, then all torrents if needed
+                
+                while cleanup_attempts > 0:
+                    # Collect all active torrents into a single list for sorting
+                    all_active = []
+                    seen_filenames = set()
+                    
+                    for status, torrents in active_by_status.items():
+                        for t in torrents:
+                            filename = t["filename"]
+                            
+                            # Skip non-duplicates on first pass
+                            is_duplicate = filename in seen_filenames
+                            if duplicates_only and not is_duplicate:
+                                continue
+                            
+                            seen_filenames.add(filename)
+                            
+                            score = 0
+                            # Prioritize keeping torrents with more progress
+                            score += t["progress"] * 100
+                            # And those with higher speeds
+                            score += min(t["speed"] / 1024, 1000)  # Cap speed bonus at 1000
+                            # And those with more seeders
+                            score += t["seeders"] * 10
+                            # Penalize older torrents slightly
+                            score -= min(t["time_elapsed"] / 60, 60)  # Cap age penalty at 60 minutes
+                            # Heavy penalty for duplicates
+                            if is_duplicate:
+                                score -= 5000  # Ensure duplicates are cleaned up first
+                            
+                            all_active.append({
+                                "id": t["id"],
+                                "score": score,
+                                "stats": t,
+                                "status": status,
+                                "is_duplicate": is_duplicate
+                            })
+                    
+                    if all_active:
+                        # Sort by score (lowest first - these will be deleted)
+                        all_active.sort(key=lambda x: x["score"])
+                        
+                        # Take enough torrents to get under the limit
+                        to_remove = min(
+                            len(all_active),  # Don't try to remove more than we have
+                            total_active - active_count["limit"] + 1  # +1 for safety margin
+                        )
+                        
+                        for torrent in all_active[:to_remove]:
+                            stats = torrent["stats"]
+                            reason = (f"fallback cleanup{' (duplicate)' if duplicates_only else ''} - {torrent['status']} "
+                                    f"(progress: {stats['progress']}%, "
+                                    f"speed: {stats['speed']/1024:.1f} KB/s, "
+                                    f"seeders: {stats['seeders']}, "
+                                    f"age: {stats['time_elapsed']/60:.1f}m)")
+                            to_delete.append((0, torrent["id"], reason, stats["time_elapsed"]))
+                            logger.info(f"Fallback cleanup marking: {stats['filename']} - {reason}")
+                        
+                        # If we found enough torrents to delete, we're done
+                        if len(to_delete) >= (total_active - active_count["limit"]):
+                            break
+                    
+                    # If we get here and duplicates_only is True, try again with all torrents
+                    duplicates_only = False
+                    cleanup_attempts -= 1
+                
+                # Log what we're about to delete
+                if to_delete:
+                    logger.info(f"Found {len(to_delete)} torrents to clean up, processing in batches of {batch_size}")
+                    for _, _, reason, _ in to_delete[:5]:  # Log first 5 for debugging
+                        logger.debug(f"Will delete: {reason}")
+            
+            # Convert to final format
+            to_delete = [(t[1], t[2]) for t in to_delete]
+            
+            # Process deletion in batches
+            while to_delete:
+                batch = to_delete[:batch_size]
+                to_delete = to_delete[batch_size:]
+                cleaned += self._batch_delete_torrents(batch)
+            
+            # Update last cleanup time if any torrents were cleaned
+            if cleaned > 0:
+                self.last_cleanup_time = current_time
+                logger.info(f"Cleaned up {cleaned} torrents")
+            else:
+                logger.warning("No torrents were cleaned up despite being over the limit!")
+            
+            return cleaned
+            
         except Exception as e:
-            logger.error(f"Failed to add torrent {stream.id} after {attempt} attempts: {e}")
+            logger.error(f"Error during cleanup: {e}")
+            return 0
+
+    def _batch_delete_torrents(self, torrents: List[Tuple[str, str]]) -> int:
+        """Delete a batch of torrents efficiently.
+        Args:
+            torrents: List of (torrent_id, reason) tuples
+        Returns:
+            Number of successfully deleted torrents
+        """
+        deleted = 0
+        for torrent_id, reason in torrents:
+            try:
+                # First try to delete associated downloads
+                try:
+                    downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
+                    for download in downloads:
+                        if download.get("torrent_id") == torrent_id:
+                            try:
+                                self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download['id']}")
+                                logger.debug(f"Deleted download {download['id']} associated with torrent {torrent_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to delete download {download['id']}: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup downloads for torrent {torrent_id}: {e}")
+
+                # Then delete the torrent
+                self.api.request_handler.execute(HttpMethod.DELETE, f"torrents/delete/{torrent_id}")
+                logger.info(f"Deleted torrent {torrent_id}: {reason}")
+                deleted += 1
+            except Exception as e:
+                if "404" in str(e):
+                    # Torrent was already deleted, count it as success
+                    logger.debug(f"Torrent {torrent_id} was already deleted")
+                    deleted += 1
+                elif "401" in str(e):
+                    logger.error("API token expired or invalid")
+                    break  # Stop processing batch
+                elif "403" in str(e):
+                    logger.error("Account locked or permission denied")
+                    break  # Stop processing batch
+                else:
+                    logger.error(f"Failed to delete torrent {torrent_id}: {e}")
+        return deleted
+
+    def _get_torrent_info(self, torrent_id: str) -> Optional[Dict]:
+        """Get detailed info for a torrent including seeders and status"""
+        try:
+            logger.debug(f"📡 Fetching info for torrent {self._color_text(torrent_id, 'cyan')}")
+            info = self.api.request_handler.execute(HttpMethod.GET, f"torrents/info/{torrent_id}")
+            
+            if not info:
+                logger.error(f"❌ Empty response for torrent {self._color_text(torrent_id, 'red')}")
+                return None
+                
+            # Log detailed torrent info
+            status = info.get('status', 'unknown')
+            filename = info.get('filename', 'unknown')
+            bytes_size = info.get('bytes', 0)
+            progress = info.get('progress', 0)
+            speed = info.get('speed', 0)
+            seeders = info.get('seeders', 0)
+            
+            logger.debug(
+                f"📊 Torrent info for {self._color_text(torrent_id, 'cyan')}:\n"
+                f"  • Name: {filename}\n"
+                f"  • Status: {self._format_status(status)}\n"
+                f"  • Size: {self._format_size(bytes_size)}\n"
+                f"  • Progress: {self._format_progress(progress, speed, seeders)}\n"
+                f"  • Files: {len(info.get('files', []))}"
+            )
+            
+            return info
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting torrent info for {self._color_text(torrent_id, 'red')}: {str(e)}")
             return None
+
+    def _handle_rate_limit(self, attempt: int) -> float:
+        """Handle rate limit with exponential backoff.
+        Returns the delay time in seconds."""
+        if attempt >= self.RATE_LIMIT_MAX_RETRIES:
+            raise Exception(f"Rate limit retry count exceeded ({self.RATE_LIMIT_MAX_RETRIES})")
+            
+        delay = min(
+            self.RATE_LIMIT_INITIAL_DELAY * (self.RATE_LIMIT_BACKOFF_BASE ** attempt),
+            self.RATE_LIMIT_MAX_DELAY
+        )
+        logger.warning(f"⏳ Rate limited, waiting {delay:.1f}s (attempt {attempt + 1}/{self.RATE_LIMIT_MAX_RETRIES})")
+        return delay
+
+    def _api_request_with_backoff(self, method: HttpMethod, endpoint: str, data: Optional[Dict] = None, 
+                                files: Optional[Dict] = None, attempt: int = 0) -> Any:
+        """Make API request with rate limit handling and exponential backoff."""
+        try:
+            # Wait for rate limiter before making request
+            self.rate_limiter.wait_if_needed()
+            
+            # Build kwargs dict for the request
+            kwargs = {}
+            if data:
+                kwargs.update(data)
+            if files:
+                kwargs.update(files)
+            
+            # Execute request with single kwargs dict
+            response = self.api.request_handler.execute(method, endpoint, kwargs)
+            
+            if not isinstance(response, (dict, list)) and response is not None:
+                logger.warning(f"Unexpected response type from API: {type(response)}")
+                
+            return response
+            
+        except Exception as e:
+            error_str = str(e)
+            
+            # Handle rate limit (509)
+            if "509" in error_str and "Active Limit Exceeded" in error_str:
+                if attempt >= self.RATE_LIMIT_MAX_RETRIES:
+                    raise Exception(f"Rate limit retry count exceeded ({self.RATE_LIMIT_MAX_RETRIES})")
+                    
+                delay = self._handle_rate_limit(attempt)
+                time.sleep(delay)
+                
+                # Recursive retry with incremented attempt count
+                return self._api_request_with_backoff(method, endpoint, data, files, attempt + 1)
+            
+            # Other API errors
+            raise
+
+    def get_torrent_info(self, torrent_id: str) -> dict:
+        """
+        Get information about a torrent
+        Required by DownloaderBase
+        """
+        if not self.initialized:
+            raise RealDebridError("Downloader not properly initialized")
+
+        response = self.api.request_handler.execute(
+            HttpMethod.GET,
+            f"torrents/info/{torrent_id}"
+        )
+        
+        # Log a cleaner version with just the important info
+        if response:
+            status = response.get('status', 'unknown')
+            progress = response.get('progress', 0)
+            speed = response.get('speed', 0)
+            seeders = response.get('seeders', 0)
+            filename = response.get('filename', 'unknown')
+            files = response.get('files', [])
+            
+            speed_mb = speed / 1000000 if speed else 0  # Convert to MB/s
+            
+            logger.debug(
+                f"📊 {self._format_progress(progress, speed_mb, seeders)}\n"
+                f"🎬 Status: {self._format_status(status)}"
+            )
+            
+            # Log file details if available
+            if files:
+                logger.debug("📁 Available files:")
+                for f in files:
+                    logger.debug(f"- {f.get('path', 'unknown')} ({f.get('bytes', 0)} bytes)")
+        
+        return response
+
+    def delete_torrent(self, torrent_id: str):
+        """
+        Delete a torrent
+        Required by DownloaderBase
+        """
+        if not self.initialized:
+            raise RealDebridError("Downloader not properly initialized")
+
+        try:
+            self.api.request_handler.execute(
+                HttpMethod.DELETE,
+                f"torrents/delete/{torrent_id}"
+            )
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str:
+                # Could mean: already deleted, invalid ID, or never existed
+                logger.warning(f"Could not delete torrent {torrent_id}: Unknown resource (404)")
+                return
+            elif "401" in str(e):
+                logger.error("API token expired or invalid")
+                raise
+            elif "403" in str(e):
+                logger.error("Account locked or permission denied")
+                raise
+            else:
+                logger.error(f"Failed to delete torrent {torrent_id}: {error_str}")
+                raise
+
+    def _can_start_download(self, content_id: str) -> bool:
+        """Check if we can start a new download for this content."""
+        with self._lock:
+            # Check if this content is already complete
+            if self._is_content_complete(content_id):
+                logger.debug(f"Content {content_id} already complete")
+                return False
+
+            # Get total unique content IDs currently downloading
+            active_content_ids = set(self.active_downloads.keys())
+            if len(active_content_ids) >= self.MAX_CONCURRENT_CONTENT and content_id not in active_content_ids:
+                logger.warning(f"⚠️ Too many content items downloading ({len(active_content_ids)}/{self.MAX_CONCURRENT_CONTENT})")
+                return False
+
+            # Check per-content limit
+            active_for_content = len(self.active_downloads.get(content_id, set()))
+            if active_for_content >= self.MAX_CONCURRENT_PER_CONTENT:
+                logger.warning(f"⚠️ Too many downloads for content {content_id} ({active_for_content}/{self.MAX_CONCURRENT_PER_CONTENT})")
+                return False
+
+            # Check total concurrent limit
+            total_active = sum(len(downloads) for downloads in self.active_downloads.values())
+            if total_active >= self.MAX_CONCURRENT_TOTAL:
+                logger.warning(f"⚠️ Too many total concurrent downloads ({total_active}/{self.MAX_CONCURRENT_TOTAL})")
+                return False
+
+            return True
 
     def _is_active_status(self, status: str) -> bool:
         """Check if a torrent status counts as active."""
@@ -1352,381 +2219,3 @@ class RealDebridDownloader(DownloaderBase):
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
-
-    def _get_torrent_info(self, torrent_id: str) -> Optional[Dict]:
-        """Get detailed info for a torrent including seeders and status"""
-        try:
-            info = self._api_request_with_backoff(HttpMethod.GET, f"torrents/info/{torrent_id}")
-            if isinstance(info, dict):
-                return info
-            logger.error(f"Invalid response from torrent info: {info}")
-            return None
-        except Exception as e:
-            logger.error(f"Error getting torrent info: {e}")
-            return None
-
-    def _api_request_with_backoff(self, method: HttpMethod, endpoint: str, data: Optional[Dict] = None, max_attempts: int = 3) -> Any:
-        """Make API request with exponential backoff for rate limits"""
-        attempt = 0
-        last_error = None
-        
-        while attempt < max_attempts:
-            try:
-                # Wait for rate limiter before making request
-                self.rate_limiter.wait_if_needed()
-                
-                # Make the request
-                if data:
-                    response = self.api.request_handler.execute(method, endpoint, data=data)
-                else:
-                    response = self.api.request_handler.execute(method, endpoint)
-                return response
-                
-            except RealDebridError as e:
-                last_error = e
-                if "rate limit exceeded" in str(e).lower():
-                    wait_time = min(2 ** attempt * 2, 30)  # Max 30 second wait
-                    logger.debug(f"Rate limit hit, waiting {wait_time}s before retry (attempt {attempt + 1}/{max_attempts})")
-                    time.sleep(wait_time)
-                    attempt += 1
-                    continue
-                raise  # Re-raise if not a rate limit error
-            except Exception as e:
-                last_error = e
-                raise
-                
-        logger.error(f"Failed after {max_attempts} attempts: {last_error}")
-        raise last_error
-
-    def _cleanup_all_except(self, exclude_ids: Set[str] = None) -> bool:
-        """Clean up all non-downloaded torrents except those in exclude_ids"""
-        exclude_ids = exclude_ids or set()
-        cleaned_ids = set()
-
-        try:
-            # Get all torrents with retries
-            max_retries = 3
-            retry_count = 0
-            torrents = None
-
-            while retry_count < max_retries:
-                try:
-                    torrents = self._api_request_with_backoff(
-                        HttpMethod.GET,
-                        "torrents",
-                        max_attempts=5
-                    )
-                    if isinstance(torrents, list):
-                        break
-                    retry_count += 1
-                    time.sleep(5)
-                except Exception as e:
-                    logger.warning(f"Failed to get torrents (attempt {retry_count + 1}/{max_retries}): {e}")
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        time.sleep(5)
-
-            if not isinstance(torrents, list):
-                logger.error(f"Invalid response from torrents endpoint after {max_retries} attempts")
-                return False
-
-            # Group torrents by status - NEVER include downloaded torrents
-            non_downloaded = []
-            errors = []
-            downloaded_count = 0
-
-            for t in torrents:
-                if not t.get('id') or t['id'] in exclude_ids:
-                    continue
-
-                status = t.get('status', '')
-                if status == "downloaded":
-                    downloaded_count += 1  # Just count them
-                    continue  # Skip downloaded torrents
-                elif status in ("error", "virus", "dead", "magnet_error"):
-                    errors.append(t)
-                else:
-                    non_downloaded.append(t)
-
-            logger.debug(
-                f"Torrent status summary:\n"
-                f"- {len(non_downloaded)} non-downloaded to clean\n"
-                f"- {len(errors)} errored to clean\n"
-                f"- {downloaded_count} downloaded (preserved)\n"
-                f"(excluding {len(exclude_ids)} torrents)"
-            )
-
-            # Process in priority order: errors -> non-downloaded
-            all_to_clean = errors + non_downloaded
-
-            # Process in small batches
-            batch_size = 2
-            for i in range(0, len(all_to_clean), batch_size):
-                batch = all_to_clean[i:i + batch_size]
-
-                for torrent in batch:
-                    torrent_id = torrent['id']
-                    if torrent_id in cleaned_ids:
-                        continue
-
-                    try:
-                        # Delete associated downloads first
-                        for link in torrent.get("links", []):
-                            try:
-                                download_id = link.split("/")[-1]
-                                self._api_request_with_backoff(
-                                    HttpMethod.DELETE,
-                                    f"downloads/delete/{download_id}",
-                                    max_attempts=3
-                                )
-                                logger.debug(f"Deleted download {download_id} for torrent {torrent_id}")
-                                time.sleep(1)
-                            except Exception as e:
-                                if "404" not in str(e):
-                                    logger.warning(f"Failed to delete download {download_id}: {e}")
-
-                        # Delete the torrent
-                        self._api_request_with_backoff(
-                            HttpMethod.DELETE,
-                            f"torrents/delete/{torrent_id}",
-                            max_attempts=3
-                        )
-                        cleaned_ids.add(torrent_id)
-                        logger.debug(f"Deleted torrent {torrent_id} (status: {torrent.get('status')})")
-
-                    except Exception as e:
-                        if "404" not in str(e):
-                            logger.warning(f"Failed to clean torrent {torrent_id}: {e}")
-
-                # Add delay between batches
-                if i + batch_size < len(all_to_clean):
-                    time.sleep(3)
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-            return False
-
-    def get_torrent_info(self, torrent_id: str) -> dict:
-        """
-        Get information about a torrent
-        Required by DownloaderBase
-        """
-        if not self.initialized:
-            raise RealDebridError("Downloader not properly initialized")
-
-        response = self.api.request_handler.execute(
-            HttpMethod.GET,
-            f"torrents/info/{torrent_id}"
-        )
-        
-        # Log a cleaner version with just the important info
-        if response:
-            status = response.get('status', 'unknown')
-            progress = response.get('progress', 0)
-            speed = response.get('speed', 0)
-            seeders = response.get('seeders', 0)
-            filename = response.get('filename', 'unknown')
-            files = response.get('files', [])
-            
-            speed_mb = speed / 1000000 if speed else 0  # Convert to MB/s
-            
-            logger.debug(
-                f"📊 {self._format_progress(progress, speed_mb, seeders)}\n"
-                f"🎬 Status: {self._format_status(status)}"
-            )
-            
-            # Log file details if available
-            if files:
-                logger.debug("📁 Available files:")
-                for f in files:
-                    logger.debug(f"- {f.get('path', 'unknown')} ({f.get('bytes', 0)} bytes)")
-        
-        return response
-
-    def delete_torrent(self, torrent_id: str):
-        """
-        Delete a torrent
-        Required by DownloaderBase
-        """
-        if not self.initialized:
-            raise RealDebridError("Downloader not properly initialized")
-
-        try:
-            self.api.request_handler.execute(
-                HttpMethod.DELETE,
-                f"torrents/delete/{torrent_id}"
-            )
-        except Exception as e:
-            error_str = str(e)
-            if "404" in error_str:
-                # Could mean: already deleted, invalid ID, or never existed
-                logger.warning(f"Could not delete torrent {torrent_id}: Unknown resource (404)")
-                return
-            elif "401" in str(e):
-                logger.error("API token expired or invalid")
-                raise
-            elif "403" in str(e):
-                logger.error("Account locked or permission denied")
-                raise
-            else:
-                logger.error(f"Failed to delete torrent {torrent_id}: {error_str}")
-                raise
-
-    def _can_start_download(self, content_id: str) -> bool:
-        """Check if we can start a new download for this content."""
-        try:
-            # Get active torrent count from API
-            active_count = self.api.request_handler.execute(HttpMethod.GET, "torrents/activeCount")
-            if not isinstance(active_count, dict):
-                logger.error(f"Invalid response from activeCount: {active_count}")
-                return False
-                
-            current_count = active_count.get("nb", 0)
-            limit = active_count.get("limit", 10)  # Default RealDebrid limit is 10
-            
-            if current_count >= limit:
-                logger.debug(f"⚠️ At active torrent limit {self._format_count(current_count, limit)}")
-                return False
-                
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to check active torrent count: {e}")
-            return False
-
-    def _add_magnet_or_torrent(self, stream: Stream, attempt: int = 1) -> Optional[Dict]:
-        """Add a magnet or torrent to Real-Debrid and return the torrent info"""
-        if attempt > 5:
-            logger.error(f"Failed to add torrent {stream.id} after {attempt-1} attempts")
-            return None
-
-        try:
-            # Respect rate limits
-            self.rate_limiter.wait_if_needed()
-
-            # Construct magnet link from infohash
-            magnet = f"magnet:?xt=urn:btih:{stream.infohash}"
-            
-            # Add the magnet
-            response = self.api.request_handler.execute(
-                HttpMethod.POST, 
-                "torrents/addMagnet", 
-                data={"magnet": magnet}
-            )
-
-            if not response or not isinstance(response, dict):
-                logger.error(f"Invalid response adding torrent {stream.id}: {response}")
-                return None
-
-            torrent_id = response.get("id")
-            if not torrent_id:
-                logger.error(f"No torrent ID in response: {response}")
-                return None
-
-            # Get info about the torrent
-            self.rate_limiter.wait_if_needed()  # Wait before making another API call
-            info = self.api.request_handler.execute(
-                HttpMethod.GET, 
-                f"torrents/info/{torrent_id}"
-            )
-            if not info or not isinstance(info, dict):
-                logger.error(f"Invalid info response for torrent {torrent_id}: {info}")
-                return None
-
-            return info
-
-        except RealDebridError as e:
-            if "rate limit exceeded" in str(e).lower():
-                # Exponential backoff with jitter
-                base_wait = min(30, 2 ** attempt)  # Cap at 30 seconds
-                jitter = random.uniform(0, 0.1 * base_wait)  # Add up to 10% jitter
-                wait_time = base_wait + jitter
-                logger.warning(f"Rate limit hit, waiting {wait_time:.1f} seconds before retry...")
-                time.sleep(wait_time)
-                return self._add_magnet_or_torrent(stream, attempt + 1)
-            logger.error(f"Failed to add torrent {stream.id} after {attempt} attempts: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to add torrent {stream.id} after {attempt} attempts: {e}")
-            return None
-
-    def _calculate_timeout(self, info: dict, item: MediaItem) -> float:
-        """Calculate download timeout based on file size and progress"""
-        # Get file size in MB
-        file_size_mb = info.get("bytes", 0) / (1024 * 1024)  # Convert to MB
-        
-        # Calculate size-based timeout (10 seconds per 50MB)
-        size_based_timeout = (file_size_mb / 50) * self.TIMEOUT_PER_50MB
-        
-        # Calculate final timeout with base and max limits
-        timeout = min(
-            self.BASE_TIMEOUT + size_based_timeout,
-            self.MAX_TIMEOUT
-        )
-        
-        # Log timeout calculation details
-        logger.debug(
-            f"Timeout calculation:\n"
-            f"  File size: {file_size_mb:.1f}MB\n"
-            f"  Base timeout: {self.BASE_TIMEOUT}s\n"
-            f"  Size-based addition: {size_based_timeout:.1f}s\n"
-            f"  Final timeout: {timeout:.1f}s"
-        )
-        
-        return timeout
-
-    def _color_text(self, text: str, color: str) -> str:
-        """Add ANSI color to text"""
-        colors = {
-            'red': '\033[91m',
-            'green': '\033[92m',
-            'yellow': '\033[93m',
-            'blue': '\033[94m',
-            'magenta': '\033[95m',
-            'cyan': '\033[96m',
-            'white': '\033[97m',
-            'reset': '\033[0m'
-        }
-        return f"{colors.get(color, '')}{text}{colors['reset']}"
-
-    def _format_status(self, status: str) -> str:
-        """Format status with color"""
-        status = status.upper()
-        color_map = {
-            'DOWNLOADED': 'green',
-            'DOWNLOADING': 'blue',
-            'QUEUED': 'yellow',
-            'WAITING_FILES_SELECTION': 'cyan',
-            'ERROR': 'red',
-            'MAGNET_ERROR': 'red',
-            'DEAD': 'red'
-        }
-        return self._color_text(status, color_map.get(status.lower(), 'white'))
-
-    def _format_progress(self, progress: float, speed: float, seeders: int) -> str:
-        """Format progress info with colors"""
-        progress_color = 'green' if progress >= 90 else 'yellow' if progress >= 50 else 'blue'
-        speed_color = 'green' if speed > 5 else 'yellow' if speed > 1 else 'blue'
-        seeders_color = 'green' if seeders > 10 else 'yellow' if seeders > 0 else 'red'
-        
-        return (
-            f"Progress: {self._color_text(f'{progress:.1f}%', progress_color)}, "
-            f"Speed: {self._color_text(f'{speed:.2f}MB/s', speed_color)}, "
-            f"Seeders: {self._color_text(str(seeders), seeders_color)}"
-        )
-
-    def _format_count(self, current: int, limit: int) -> str:
-        """Format count with color based on how close to limit"""
-        color = 'green' if current < limit * 0.7 else 'yellow' if current < limit * 0.9 else 'red'
-        return self._color_text(f"{current}/{limit}", color)
-
-    def _format_attempt(self, attempt: int, max_attempts: int) -> str:
-        """Format attempt counter with color"""
-        color = 'green' if attempt <= max_attempts/2 else 'yellow' if attempt <= max_attempts*0.8 else 'red'
-        return self._color_text(f"attempt {attempt}/{max_attempts}", color)
-
-    def _format_deletion(self, reason: str) -> str:
-        """Format deletion message"""
-        return self._color_text(f"🗑️ {reason}", 'red')
