@@ -37,6 +37,7 @@ Downloader = Union[RealDebridDownloader,
 Service = Union[Content, SymlinkLibrary, Scraper, Downloader, Symlinker, Updater]
 MediaItemGenerator = Generator[MediaItem, None, MediaItem | None]
 
+@dataclass
 class ProcessedEvent:
     service: Service
     related_media_items: list[MediaItem]

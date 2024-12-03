@@ -11,12 +11,25 @@ from program.services.downloaders.shared import (
 )
 
 from .alldebrid import AllDebridDownloader
-from .realdebrid import RealDebridDownloader, TorrentNotFoundError, InvalidFileIDError
+from .realdebrid import RealDebridDownloader, RealDebridAPI, TorrentNotFoundError, InvalidFileIDError
 # from .torbox import TorBoxDownloader
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from dataclasses import dataclass
+from typing import Optional
+import time
 
 class InvalidFileSizeException(Exception):
+    """Exception raised when file size is invalid."""
     pass
+
+@dataclass
+class DownloadResult:
+    success: bool
+    stream: Stream
+    result: Optional[DownloadCachedStreamResult] = None
+    error: Optional[str] = None
 
 class Downloader:
     def __init__(self):
@@ -25,11 +38,30 @@ class Downloader:
         self.speed_mode = (
             settings_manager.settings.downloaders.prefer_speed_over_quality
         )
-        self.services = {
-            RealDebridDownloader: RealDebridDownloader(),
-            AllDebridDownloader: AllDebridDownloader(),
-            # TorBoxDownloader: TorBoxDownloader()
-        }
+        
+        # Initialize RealDebrid API
+        rd_settings = settings_manager.settings.downloaders.real_debrid
+        rd_api = None
+        if rd_settings and rd_settings.api_key:
+            rd_api = RealDebridAPI(rd_settings.api_key, rd_settings.proxy_url if rd_settings.proxy_enabled else None)
+            
+        # Initialize services
+        self.services = {}
+        if rd_api:
+            rd_downloader = RealDebridDownloader(rd_api)
+            if rd_downloader.initialize():
+                self.services[RealDebridDownloader] = rd_downloader
+            else:
+                logger.error("Failed to initialize RealDebrid downloader")
+                
+        # Initialize other services
+        ad_downloader = AllDebridDownloader()
+        if ad_downloader:
+            self.services[AllDebridDownloader] = ad_downloader
+        
+        # Filter out None services
+        self.services = {k: v for k, v in self.services.items() if v is not None}
+        
         self.service = next(
             (service for service in self.services.values() if service.initialized), None
         )
@@ -42,6 +74,108 @@ class Downloader:
                 "No downloader service is initialized. Please initialize a downloader service."
             )
             return False
+        return True
+
+    def _try_download_stream(self, item: MediaItem, stream: Stream) -> DownloadResult:
+        """Try to download a single stream and return the result"""
+        torrent_id = None
+        try:
+            result = self.service.download_cached_stream(item, stream)
+            
+            # Skip if no result or container
+            if not result or not result.container:
+                if not result:
+                    logger.debug(f"No result returned for stream {stream.infohash}")
+                else:
+                    logger.debug(f"No valid files found in torrent for stream {stream.infohash}")
+                    item.blacklist_stream(stream)
+                return DownloadResult(success=False, stream=stream, error="No valid files", result=result)
+
+            # Store torrent ID for potential cleanup
+            torrent_id = result.torrent_id
+
+            # For episodes, check if the required episode is present
+            if item.type == ShowMediaType.Episode.value:
+                required_season = item.parent.number
+                required_episode = item.number
+                found_required_episode = False
+
+                for file_data in result.container.values():
+                    season, episodes = self.service.file_finder.container_file_matches_episode(file_data)
+                    if season == required_season and episodes and required_episode in episodes:
+                        found_required_episode = True
+                        break
+
+                if not found_required_episode:
+                    logger.debug(f"Required episode S{required_season:02d}E{required_episode:02d} not found in torrent {result.torrent_id}, trying next stream")
+                    item.blacklist_stream(stream)
+                    return DownloadResult(success=False, stream=stream, error="Episode not found", result=result)
+
+            # Validate filesize
+            try:
+                self.validate_filesize(item, result)
+            except InvalidFileSizeException:
+                logger.debug(f"Invalid filesize for stream {stream.infohash}")
+                item.blacklist_stream(stream)
+                return DownloadResult(success=False, stream=stream, error="Invalid filesize", result=result)
+            
+            return DownloadResult(success=True, stream=stream, result=result)
+                
+        except InvalidFileIDError as e:
+            # Don't blacklist for file ID errors as they may be temporary
+            logger.debug(f"File selection failed for stream {stream.infohash}: {str(e)}")
+            return DownloadResult(success=False, stream=stream, error=str(e), result=None)
+        except Exception as e:
+            logger.debug(f"Invalid stream: {stream.infohash} - reason: {str(e)}")
+            item.blacklist_stream(stream)
+            return DownloadResult(success=False, stream=stream, error=str(e), result=None)
+
+    def _cleanup_torrent(self, torrent_id: str, max_retries: int = 3, retry_delay: float = 1.0) -> bool:
+        """Clean up a torrent with retries"""
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"Cleaning up torrent {torrent_id} (attempt {attempt + 1}/{max_retries})")
+                self.service.delete_torrent(torrent_id)
+                # Wait a bit to ensure the torrent is actually deleted
+                time.sleep(retry_delay)
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.debug(f"Error cleaning up torrent {torrent_id}, retrying in {retry_delay}s: {str(e)}")
+                    time.sleep(retry_delay)
+                else:
+                    logger.debug(f"Failed to clean up torrent {torrent_id} after {max_retries} attempts: {str(e)}")
+        return False
+
+    def _should_cleanup_torrent(self, item: MediaItem, result: DownloadResult, successful_result: DownloadResult) -> bool:
+        """Determine if a torrent should be cleaned up based on content type and result"""
+        if result == successful_result:
+            return False  # Never clean up the successful download
+            
+        if not result.result or not result.result.torrent_id:
+            return False  # No torrent to clean up
+            
+        # Only clean up torrents that are explicitly in downloading or waiting for file selection state
+        # Leave unknown state torrents alone
+        is_active = (hasattr(result.result, 'is_downloading') and result.result.is_downloading or
+                    hasattr(result.result, 'is_waiting_for_file_selection') and result.result.is_waiting_for_file_selection)
+        if not is_active:
+            return False
+            
+        # For shows, only clean up if we're sure the torrent doesn't contain other needed episodes
+        if item.type == ShowMediaType.Episode.value:
+            # Keep torrent if it might contain other episodes we need
+            required_season = item.parent.number
+            required_episode = item.number
+            
+            if result.result.container:
+                for file_data in result.result.container.values():
+                    season, episodes = self.service.file_finder.container_file_matches_episode(file_data)
+                    # If this torrent contains episodes from our season, keep it
+                    if season == required_season and episodes and len(episodes) > 1:
+                        logger.debug(f"Keeping torrent {result.result.torrent_id} as it may contain other needed episodes")
+                        return False
+                        
         return True
 
     def run(self, item: MediaItem):
@@ -71,66 +205,67 @@ class Downloader:
             logger.warning(f"No streams available for {item.log_string} after scraping")
             return
 
-        # Take only the top 6 streams to try
+        # Take only the top 5 streams to try
         concurrent_streams = sorted_streams[:5]
         successful_download = False
-
-        for stream in concurrent_streams:
-            try:
-                result = self.service.download_cached_stream(item, stream)
+        active_results = []
+        running_futures = {}
+        
+        # Create a thread pool with max workers set to MAX_CONCURRENT_PER_CONTENT
+        with ThreadPoolExecutor(max_workers=self.service.MAX_CONCURRENT_PER_CONTENT) as executor:
+            # Submit all downloads to the thread pool
+            for stream in concurrent_streams:
+                future = executor.submit(self._try_download_stream, item, stream)
+                running_futures[future] = stream
+            
+            # Process results as they complete
+            while running_futures:
+                done, _ = wait(running_futures.keys(), return_when=FIRST_COMPLETED)
                 
-                # Skip if no result or container
-                if not result or not result.container:
-                    if not result:
-                        logger.debug(f"No result returned for stream {stream.infohash}")
-                    else:
-                        logger.debug(f"No valid files found in torrent for stream {stream.infohash}")
-                        item.blacklist_stream(stream)
-                    continue
+                for future in done:
+                    stream = running_futures.pop(future)
+                    try:
+                        result = future.result()
+                        active_results.append(result)
+                        
+                        if result.success and result.result:
+                            # Update item attributes if download was successful
+                            if result.result.torrent_id and self.update_item_attributes(item, result.result):
+                                successful_download = True
+                                
+                                # Immediately clean up other downloads for this content
+                                logger.debug(f"Successfully downloaded {item.log_string}, cleaning up other torrents for this content...")
+                                
+                                # Cancel all remaining futures first
+                                for f in running_futures:
+                                    f.cancel()
+                                
+                                # Wait a moment for cancellation to take effect
+                                time.sleep(1.0)
+                                
+                                # Clean up only torrents that don't contain other needed episodes
+                                for cleanup_result in active_results:
+                                    if self._should_cleanup_torrent(item, cleanup_result, result):
+                                        self._cleanup_torrent(cleanup_result.result.torrent_id)
+                                
+                                # Store state and yield only after cleanup
+                                item.store_state()
+                                yield item
+                                return  # Exit immediately after successful download
+                    except Exception as e:
+                        logger.debug(f"Error processing download result: {str(e)}")
 
-                # For episodes, check if the required episode is present
-                if item.type == ShowMediaType.Episode.value:
-                    required_season = item.parent.number
-                    required_episode = item.number
-                    found_required_episode = False
-
-                    for file_data in result.container.values():
-                        season, episodes = self.service.file_finder.container_file_matches_episode(file_data)
-                        if season == required_season and episodes and required_episode in episodes:
-                            found_required_episode = True
-                            break
-
-                    if not found_required_episode:
-                        logger.debug(f"Required episode S{required_season:02d}E{required_episode:02d} not found in torrent {result.torrent_id}, trying next stream")
-                        item.blacklist_stream(stream)
-                        continue
-
-                # Validate filesize
-                try:
-                    self.validate_filesize(item, result)
-                except InvalidFileSizeException:
-                    logger.debug(f"Invalid filesize for stream {stream.infohash}")
-                    item.blacklist_stream(stream)
-                    continue
-                
-                # Update item attributes if download was successful
-                if result.torrent_id and self.update_item_attributes(item, result):
-                    successful_download = True
-                    item.store_state()
-                    yield item
-                    break  # Exit loop since we have a successful download
-                    
-            except InvalidFileIDError as e:
-                # Don't blacklist for file ID errors as they may be temporary
-                logger.debug(f"File selection failed for stream {stream.infohash}: {str(e)}")
-                continue
-            except Exception as e:
-                logger.debug(f"Invalid stream: {stream.infohash} - reason: {str(e)}")
-                item.blacklist_stream(stream)
-                continue
-
-        if not successful_download:
-            logger.warning(f"No successful download for {item.log_string} after trying {len(concurrent_streams)} streams")
+            # If no successful download, only clean up explicitly active downloads
+            if not successful_download:
+                for result in active_results:
+                    if result.result and result.result.torrent_id:
+                        is_active = (hasattr(result.result, 'is_downloading') and result.result.is_downloading or
+                                   hasattr(result.result, 'is_waiting_for_file_selection') and result.result.is_waiting_for_file_selection)
+                        if is_active:
+                            # For shows, only clean up if we're sure we don't need the episodes
+                            if item.type != ShowMediaType.Episode.value or not result.result.container:
+                                self._cleanup_torrent(result.result.torrent_id)
+                logger.warning(f"No successful download for {item.log_string} after trying {len(concurrent_streams)} streams")
 
     def download_cached_stream(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
         """Download a cached stream from the active debrid service"""

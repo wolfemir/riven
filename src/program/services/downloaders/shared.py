@@ -69,11 +69,13 @@ class DownloaderBase(ABC):
 
 class DownloadCachedStreamResult:
     """Result object for cached stream downloads"""
-    def __init__(self, container=None, torrent_id=None, info=None, info_hash=None):
+    def __init__(self, container=None, torrent_id=None, info=None, info_hash=None, success=True, error=None):
         self.container = container
         self.torrent_id = torrent_id
         self.info = info
         self.info_hash = info_hash
+        self.success = success
+        self.error = error
 
 class FileFinder:
     """
