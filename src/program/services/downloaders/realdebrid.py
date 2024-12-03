@@ -1149,43 +1149,69 @@ class RealDebridDownloader(DownloaderBase):
 
     def _add_magnet_or_torrent(self, magnet: Optional[str] = None, torrent: Optional[bytes] = None) -> TorrentAddResult:
         """Add a magnet link or torrent file to Real-Debrid with rate limit handling."""
-        try:
-            # Log what we're trying to add
-            if magnet:
-                logger.debug(f"🧲 Adding magnet: {magnet[:60]}...")
-            else:
-                logger.debug("📁 Adding torrent file")
-            
-            # Prepare request data
-            data = {}
-            files = {}
-            
-            if magnet:
-                data["magnet"] = magnet
-            elif torrent:
-                files = {"files[]": ("file.torrent", torrent)}
-            
-            # Make API request
-            response = self.api.request_handler.execute(
-                HttpMethod.POST, 
-                "torrents/addMagnet" if magnet else "torrents/addTorrent",
-                data=data,
-                files=files
-            )
-            
-            # Log response details
-            if response:
-                torrent_id = response.get("id")
-                logger.debug(f"✅ Successfully added torrent {self._color_text(torrent_id, 'green')}")
-                return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
-            else:
-                logger.error("❌ Empty response from Real-Debrid API")
-                return TorrentAddResult(success=False, error="Empty API response", torrent_id="", info={})
+        max_retries = 5
+        base_delay = 2  # Base delay in seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Log what we're trying to add
+                if magnet:
+                    logger.debug(f"🧲 Adding magnet (attempt {attempt + 1}/{max_retries}): {magnet[:60]}...")
+                else:
+                    logger.debug(f"📁 Adding torrent file (attempt {attempt + 1}/{max_retries})")
                 
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"❌ Failed to add torrent: {error_msg}")
-            return TorrentAddResult(success=False, error=error_msg, torrent_id="", info={})
+                # Prepare request data
+                data = {}
+                files = {}
+                
+                if magnet:
+                    data["magnet"] = magnet
+                elif torrent:
+                    files = {"files[]": ("file.torrent", torrent)}
+                
+                # Make API request
+                response = self.api.request_handler.execute(
+                    HttpMethod.POST, 
+                    "torrents/addMagnet" if magnet else "torrents/addTorrent",
+                    data=data,
+                    files=files
+                )
+                
+                # Log response details
+                if response:
+                    torrent_id = response.get("id")
+                    logger.debug(f"✅ Successfully added torrent {self._color_text(torrent_id, 'green')}")
+                    return TorrentAddResult(success=True, error=None, torrent_id=torrent_id, info=response)
+                else:
+                    logger.error("❌ Empty response from Real-Debrid API")
+                    
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Check if it's a rate limit error
+                if "509" in error_msg and "Active Limit Exceeded" in error_msg:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    
+                    # Try to cleanup inactive torrents before retrying
+                    if attempt < max_retries - 1:  # Don't cleanup on last attempt
+                        logger.warning(f"⚠️ Active limit exceeded, cleaning up inactive torrents...")
+                        deleted = self._cleanup_inactive_torrents()
+                        if deleted:
+                            logger.info(f"🧹 Cleaned up {deleted} inactive torrents")
+                            delay = 1  # Reduce delay if we cleaned up torrents
+                        
+                        logger.warning(f"⏳ Retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(delay)
+                        continue
+                
+                logger.error(f"❌ Failed to add torrent: {error_msg}")
+                
+                # On last attempt, return error
+                if attempt == max_retries - 1:
+                    return TorrentAddResult(success=False, error=error_msg, torrent_id="", info={})
+                    
+        # Should never reach here, but just in case
+        return TorrentAddResult(success=False, error="Max retries exceeded", torrent_id="", info={})
 
     def _calculate_timeout(self, info: dict, item: MediaItem) -> float:
         """Calculate download timeout based on file size and progress"""
