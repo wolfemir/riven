@@ -328,7 +328,7 @@ class RealDebridAPI:
     # API endpoints
     ENDPOINTS = {
         'torrents': 'torrents',
-        'torrents_active': 'torrents/activeCount',  # Fixed: use activeCount endpoint
+        'torrents_active': 'torrents/activeCount',  
         'torrents_info': 'torrents/info',
         'torrents_completed': 'torrents/completed',
         'unrestrict': 'unrestrict/link'
@@ -1018,7 +1018,7 @@ class RealDebridDownloader(DownloaderBase):
             # First check active count
             active_info = self.api.request_handler.execute(
                 HttpMethod.GET, 
-                self.ENDPOINTS['torrents_active']
+                'torrents/activeCount'
             )
             
             active_count = active_info.get('count', 0)
@@ -1028,7 +1028,7 @@ class RealDebridDownloader(DownloaderBase):
                 # Then get full torrent list only if we have active torrents
                 torrents = self.api.request_handler.execute(
                     HttpMethod.GET,
-                    self.ENDPOINTS['torrents']
+                    'torrents'
                 )
                 
                 if not isinstance(torrents, list):
@@ -1095,10 +1095,8 @@ class RealDebridDownloader(DownloaderBase):
         """Finalize download by checking for completed torrents"""
         try:
             # Get completed torrents
-            completed_torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
-            if not completed_torrents:
-                return DownloadCachedStreamResult(success=False, error="No completed torrents found")
-            
+            completed_torrents = self.api.request_handler.execute(HttpMethod.GET, 'torrents/completed')
+
             # Find matching torrent
             for torrent in completed_torrents:
                 torrent_id = torrent.get("id", "")
@@ -1602,7 +1600,7 @@ class RealDebridDownloader(DownloaderBase):
         try:
             # Get list of all torrents with rate limit handling
             with self.rate_limiter:
-                torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
+                torrents = self.api.request_handler.execute(HttpMethod.GET, 'torrents')
                 
             if not torrents:
                 logger.warning("No torrents found to clean up")
@@ -1646,7 +1644,7 @@ class RealDebridDownloader(DownloaderBase):
         deleted = 0
         # Get all downloads in one request to minimize API calls
         try:
-            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
+            downloads = self.api.request_handler.execute(HttpMethod.GET, 'torrents/completed')
             downloads_by_torrent = {}
             for download in downloads:
                 torrent_id = download.get("torrent_id")
@@ -1707,7 +1705,7 @@ class RealDebridDownloader(DownloaderBase):
             logger.debug(f"📡 Fetching info for torrent {torrent_id}")
             info = self.api.request_handler.execute(
                 HttpMethod.GET,
-                f"{self.api.ENDPOINTS['torrents_info']}/{torrent_id}"
+                f"torrents/info/{torrent_id}"
             )
             
             # Cache the result
@@ -1728,7 +1726,7 @@ class RealDebridDownloader(DownloaderBase):
 
         response = self.api.request_handler.execute(
             HttpMethod.GET,
-            f"{self.api.ENDPOINTS['torrents_info']}/{torrent_id}"
+            f"torrents/info/{torrent_id}"
         )
         
         # Log a cleaner version with just the important info
@@ -1845,7 +1843,7 @@ class RealDebridDownloader(DownloaderBase):
                 aggressive_cleanup = True
             
             # Get list of all torrents
-            torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
+            torrents = self.api.request_handler.execute(HttpMethod.GET, 'torrents')
             to_delete = []  # List of (priority, torrent_id, reason) tuples
             
             # Track torrents by various attributes
