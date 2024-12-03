@@ -333,12 +333,13 @@ class RealDebridAPI:
     
     def _create_request_handler(self):
         """Create a request handler with proper headers and rate limiting."""
-        session = create_service_session(
-            headers={
-                'Authorization': f'Bearer {self.api_key}'
-            },
-            proxy_url=self.proxy_url
-        )
+        session = create_service_session()
+        if self.proxy_url:
+            session.proxies = {'http': self.proxy_url, 'https': self.proxy_url}
+        session.headers.update({
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        })
         
         handler = RealDebridRequestHandler(
             session=session,
@@ -349,13 +350,21 @@ class RealDebridAPI:
         # Wrap execute method to enforce rate limiting
         original_execute = handler.execute
         def rate_limited_execute(*args, **kwargs):
-            try:
-                with self.rate_limiter:
-                    return original_execute(*args, **kwargs)
-            except Exception as e:
-                if "rate limit exceeded" in str(e).lower():
-                    self.rate_limiter.handle_error()
-                raise
+            max_retries = 3
+            retry_count = 0
+            while retry_count < max_retries:
+                try:
+                    with self.rate_limiter:
+                        return original_execute(*args, **kwargs)
+                except Exception as e:
+                    if "rate limit exceeded" in str(e).lower():
+                        retry_count += 1
+                        self.rate_limiter.handle_error()
+                        if retry_count < max_retries:
+                            time.sleep(2 ** retry_count)  # Exponential backoff
+                            continue
+                    raise
+            raise RealDebridError("Max retries exceeded for rate limited request")
         
         handler.execute = rate_limited_execute
         return handler
@@ -991,173 +1000,97 @@ class RealDebridDownloader(DownloaderBase):
 
     def download_cached_stream(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
         """Download a stream from Real-Debrid with sequential parallel checking"""
-        content_id = item.id if item else None
-
-        # Check if we can start a new download
-        if not self._can_start_download(content_id):
-            return DownloadCachedStreamResult(
-                success=False,
-                error=f"Cannot start new download - content limit reached"
-            )
-
-        active_torrents = {}  # Track active torrents and their info
-        alternative_streams = self._get_alternative_streams(item, stream, max_count=self.MAX_PARALLEL_TORRENTS-1)
-        
-        def add_and_check_torrent(stream_to_add):
-            """Add a torrent and check its initial status"""
-            result = self.add_torrent(stream_to_add)
-            if not result or not result.torrent_id:
-                return None
-                
-            torrent_id = result.torrent_id
-            active_torrents[torrent_id] = {
-                'stream': stream_to_add,
-                'content_name': item.name if item else "Unknown",
-                'added_time': time.time(),
-            }
+        try:
+            # Use cached active torrents if available (cache for 30 seconds)
+            current_time = int(time.time())
+            if (hasattr(self, '_active_torrents_cache') and 
+                current_time - self._active_torrents_last_check < 30):
+                active_torrents = self._active_torrents_cache
+                logger.debug(f"Using cached active torrents list ({len(active_torrents)})")
+            else:
+                # Get active torrents with a single request
+                active_info = self.api.request_handler.execute(HttpMethod.GET, '/torrents/active')
+                active_torrents = active_info.get('torrents', [])
+                # Update cache
+                self._active_torrents_cache = active_torrents
+                self._active_torrents_last_check = current_time
             
-            logger.debug(f"🚀 Added torrent {self._color_text(torrent_id, 'cyan')}")
-            
-            # Wait initial delay
-            time.sleep(self.INITIAL_CHECK_DELAY)
-            
-            # Check torrent status
-            info = self._get_torrent_info(torrent_id)
-            if info and info.get('status') == RDTorrentStatus.DOWNLOADED.value:
-                logger.debug(f"✨ Torrent {self._color_text(torrent_id, 'green')} is ready for download")
-                return torrent_id
-            
-            return None
-        
-        # Step 1: Try initial torrent
-        logger.debug(f"📥 Trying initial torrent...")
-        downloaded_id = add_and_check_torrent(stream)
-        if downloaded_id:
-            return self.wait_for_download(downloaded_id, content_id, item, stream)
-        
-        # Step 2: Try alternative torrents sequentially
-        for idx, alt_stream in enumerate(alternative_streams, 1):
-            if len(active_torrents) >= self.MAX_PARALLEL_TORRENTS:
-                break
-                
-            logger.debug(f"📥 Trying alternative torrent {idx}/{len(alternative_streams)}...")
-            downloaded_id = add_and_check_torrent(alt_stream)
-            if downloaded_id:
-                # Clean up other torrents
-                for other_id in list(active_torrents.keys()):
-                    if other_id != downloaded_id:
-                        self.delete_torrent(other_id)
-                return self.wait_for_download(downloaded_id, content_id, item, alt_stream)
-            
-            # Wait before adding next torrent
-            if idx < len(alternative_streams):
-                time.sleep(self.TORRENT_ADD_INTERVAL)
-        
-        # Step 3: Monitor all torrents
-        start_time = time.time()
-        last_check_time = 0
-        best_torrent = None
-        best_seeders = -1
-        
-        while active_torrents:
-            current_time = datetime.now()
-            
-            # First get active torrent count
-            active_info = self.api.request_handler.execute(HttpMethod.GET, '/torrents/active')
-            active_count = len(active_info.get('torrents', []))
-            logger.debug(f"🔍 Found {active_count} active torrents")
-            
-            # Then check individual torrents
+            active_count = len(active_torrents)
             if active_count > 0:
-                logger.debug(f"🔍 Checking {active_count} active torrents...")
-                active_torrents = self.api.request_handler.execute(HttpMethod.GET, '/torrents')
-            
-            current_time = time.time()
-            
-            # Check all torrents every PARALLEL_CHECK_INTERVAL seconds
-            if current_time - last_check_time < self.PARALLEL_CHECK_INTERVAL:
-                time.sleep(1)
-                continue
+                logger.debug(f"🔍 Found {active_count} active torrents")
                 
-            last_check_time = current_time
-            logger.debug(f"🔍 Checking {len(active_torrents)} active torrents...")
+                # Process torrents in smaller batches with rate limiting
+                batch_size = 2  # Reduced batch size
+                for i in range(0, len(active_torrents), batch_size):
+                    batch = active_torrents[i:i + batch_size]
+                    
+                    # Process each batch
+                    for torrent_id in batch:
+                        info = self._get_torrent_info(torrent_id)
+                        if info:
+                            status = info.get('status')
+                            if status in ['downloaded', 'uploading', 'magnet_conversion']:
+                                self._process_torrent_status(torrent_id, info, item)
+                        
+                        # Add delay between requests in the same batch
+                        time.sleep(1)  # Increased delay between requests
+                    
+                    # Add larger delay between batches
+                    if i + batch_size < len(active_torrents):
+                        time.sleep(2)  # Increased delay between batches
             
-            status_summary = []
-            for torrent_id, data in list(active_torrents.items()):
+            return self._finalize_download(item, stream)
+            
+        except Exception as e:
+            logger.error(f"❌ Error in download_cached_stream: {str(e)}")
+            if "rate limit exceeded" in str(e).lower():
+                self.rate_limiter.handle_error()
+            raise
+
+    def _process_torrent_status(self, torrent_id: str, info: dict, item: MediaItem):
+        """Process torrent status with rate limiting awareness"""
+        try:
+            status = info.get('status', 'unknown')
+            filename = info.get('filename', 'unknown')
+            progress = info.get('progress', 0)
+            
+            if status == 'downloaded':
+                logger.info(f"✅ Torrent {torrent_id} downloaded: {filename}")
+                self._handle_downloaded_torrent(torrent_id, info, item)
+            elif status == 'uploading':
+                logger.debug(f"⬆️ Torrent {torrent_id} uploading: {progress}%")
+            elif status == 'magnet_conversion':
+                logger.debug(f"🧲 Torrent {torrent_id} converting magnet")
+            else:
+                logger.debug(f"ℹ️ Torrent {torrent_id} status: {status}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error processing torrent {torrent_id}: {str(e)}")
+
+    def _finalize_download(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
+        """Finalize download by checking for completed torrents"""
+        try:
+            # Get completed torrents
+            completed_torrents = self.api.request_handler.execute(HttpMethod.GET, '/torrents/completed')
+            if not completed_torrents:
+                return DownloadCachedStreamResult(success=False, error="No completed torrents found")
+            
+            # Find matching torrent
+            for torrent in completed_torrents:
+                torrent_id = torrent.get("id", "")
                 info = self._get_torrent_info(torrent_id)
-                if not info:
-                    continue
-                    
-                status = info.get('status', 'unknown')
-                seeders = info.get('seeders', 0)
-                speed = info.get('speed', 0)
-                progress = info.get('progress', 0)
-                content_name = data.get('content_name', 'Unknown')
-                
-                # Format speed nicely
-                speed_str = f"{speed/1024/1024:.1f}MB/s" if speed > 1024*1024 else f"{speed/1024:.1f}KB/s" if speed > 0 else "0KB/s"
-                
-                # Add status details
-                status_details = f"[{self._color_text(content_name, 'yellow')}] "
-                status_details += f"{status} ({progress:.1f}%) "
-                status_details += f"🌱{seeders} "  # Seeders with plant emoji
-                status_details += f"⚡{speed_str}"  # Speed with lightning emoji
-                status_summary.append(status_details)
+                if info:
+                    # Check if this torrent matches our item
+                    if info.get("filename") == item.name:
+                        logger.info(f"✅ Found matching torrent {torrent_id} for {item.name}")
+                        return DownloadCachedStreamResult(success=True, torrent_id=torrent_id, info=info)
             
-            if status_summary:
-                logger.debug("Torrent Status:\n" + "\n".join(f"  • {s}" for s in status_summary))
-            
-            for torrent_id, data in list(active_torrents.items()):
-                info = self._get_torrent_info(torrent_id)
-                if not info:
-                    continue
-                    
-                status = info.get('status', 'unknown')
-                seeders = info.get('seeders', 0)
-                
-                # Found a downloaded torrent
-                if status == RDTorrentStatus.DOWNLOADED.value:
-                    logger.debug(f"✅ Found downloaded torrent {self._color_text(torrent_id, 'green')}")
-                    
-                    # Clean up other torrents
-                    for other_id in list(active_torrents.keys()):
-                        if other_id != torrent_id:
-                            self.delete_torrent(other_id)
-                            
-                    return self.wait_for_download(torrent_id, content_id, item, data['stream'])
-                
-                # Track best seeder count
-                if seeders > best_seeders:
-                    best_seeders = seeders
-                    best_torrent = (torrent_id, data)
-                    logger.debug(f"⭐ New best torrent {self._color_text(torrent_id, 'yellow')} with {seeders} seeders")
-                    
-                    # Clean up torrents with fewer seeders
-                    for other_id, other_data in list(active_torrents.items()):
-                        if other_id != torrent_id:
-                            other_info = self._get_torrent_info(other_id)
-                            if other_info and other_info.get('seeders', 0) < seeders:
-                                logger.debug(f"🗑️ Removing torrent {self._color_text(other_id, 'red')} with fewer seeders ({other_info.get('seeders', 0)} < {seeders})")
-                                self.delete_torrent(other_id)
-                                del active_torrents[other_id]
-                
-                # Remove dead torrents
-                if status in [RDTorrentStatus.MAGNET_ERROR.value, RDTorrentStatus.ERROR.value, RDTorrentStatus.DEAD.value]:
-                    logger.debug(f"❌ Removing dead torrent {self._color_text(torrent_id, 'red')}")
-                    del active_torrents[torrent_id]
-                    self.delete_torrent(torrent_id)
-            
-            # If we have a best torrent, keep only that one
-            if best_torrent and len(active_torrents) > 1:
-                best_id, _ = best_torrent
-                for other_id in list(active_torrents.keys()):
-                    if other_id != best_id:
-                        logger.debug(f"🗑️ Removing non-best torrent {self._color_text(other_id, 'red')}")
-                        self.delete_torrent(other_id)
-                        del active_torrents[other_id]
+            # If no matching torrent found, return error
+            return DownloadCachedStreamResult(success=False, error="No matching torrent found")
         
-        # If we get here, no torrent succeeded
-        return DownloadCachedStreamResult(success=False, error="No torrents downloaded successfully")
+        except Exception as e:
+            logger.error(f"❌ Error finalizing download: {str(e)}")
+            return DownloadCachedStreamResult(success=False, error=str(e))
 
     def _get_retry_hours(self, scrape_times: int) -> float:
         """Get retry hours based on number of scrape attempts."""
@@ -1736,89 +1669,30 @@ class RealDebridDownloader(DownloaderBase):
         return deleted
 
     def _get_torrent_info(self, torrent_id: str) -> Optional[Dict]:
-        """Get detailed info for a torrent including seeders and status"""
+        """Get detailed info for a torrent with error handling and caching."""
         try:
-            logger.debug(f"📡 Fetching info for torrent {self._color_text(torrent_id, 'cyan')}")
-            info = self.api.request_handler.execute(HttpMethod.GET, f"torrents/info/{torrent_id}")
+            # Use class-level cache to avoid duplicate requests
+            if not hasattr(self, '_torrent_info_cache'):
+                self._torrent_info_cache = {}
             
-            if not info:
-                logger.error(f"❌ Empty response for torrent {self._color_text(torrent_id, 'red')}")
-                return None
-                
-            # Log detailed torrent info
-            status = info.get('status', 'unknown')
-            filename = info.get('filename', 'unknown')
-            bytes_size = info.get('bytes', 0)
-            progress = info.get('progress', 0)
-            speed = info.get('speed', 0)
-            seeders = info.get('seeders', 0)
+            # Check cache first
+            cache_key = f"{torrent_id}_{int(time.time() / 30)}"  # Cache for 30 seconds
+            if cache_key in self._torrent_info_cache:
+                return self._torrent_info_cache[cache_key]
             
-            logger.debug(
-                f"📊 Torrent info for {self._color_text(torrent_id, 'cyan')}:\n"
-                f"  • Name: {filename}\n"
-                f"  • Status: {self._format_status(status)}\n"
-                f"  • Size: {self._format_size(bytes_size)}\n"
-                f"  • Progress: {self._format_progress(progress, speed, seeders)}\n"
-                f"  • Files: {len(info.get('files', []))}"
+            logger.debug(f"📡 Fetching info for torrent {torrent_id}")
+            info = self.api.request_handler.execute(
+                HttpMethod.GET,
+                f'/torrents/info/{torrent_id}'
             )
             
+            # Cache the result
+            self._torrent_info_cache[cache_key] = info
             return info
             
         except Exception as e:
-            logger.error(f"❌ Error getting torrent info for {self._color_text(torrent_id, 'red')}: {str(e)}")
+            logger.error(f"❌ Error getting torrent info for {torrent_id}: {str(e)}")
             return None
-
-    def _handle_rate_limit(self, attempt: int) -> float:
-        """Handle rate limit with exponential backoff.
-        Returns the delay time in seconds."""
-        if attempt >= self.RATE_LIMIT_MAX_RETRIES:
-            raise Exception(f"Rate limit retry count exceeded ({self.RATE_LIMIT_MAX_RETRIES})")
-            
-        delay = min(
-            self.RATE_LIMIT_INITIAL_DELAY * (self.RATE_LIMIT_BACKOFF_BASE ** attempt),
-            self.RATE_LIMIT_MAX_DELAY
-        )
-        logger.warning(f"⏳ Rate limited, waiting {delay:.1f}s (attempt {attempt + 1}/{self.RATE_LIMIT_MAX_RETRIES})")
-        return delay
-
-    def _api_request_with_backoff(self, method: HttpMethod, endpoint: str, data: Optional[Dict] = None, 
-                                files: Optional[Dict] = None, attempt: int = 0) -> Any:
-        """Make API request with rate limit handling and exponential backoff."""
-        try:
-            # Wait for rate limiter before making request
-            self.api.rate_limiter.acquire()
-            
-            # Build kwargs dict for the request
-            kwargs = {}
-            if data:
-                kwargs.update(data)
-            if files:
-                kwargs.update(files)
-            
-            # Execute request with single kwargs dict
-            response = self.api.request_handler.execute(method, endpoint, kwargs)
-            
-            if not isinstance(response, (dict, list)) and response is not None:
-                logger.warning(f"Unexpected response type from API: {type(response)}")
-                
-            return response
-            
-        except Exception as e:
-            error_str = str(e)
-            
-            # Handle rate limit (509)
-            if "509" in error_str and "Active Limit Exceeded" in error_str:
-                if attempt >= self.RATE_LIMIT_MAX_RETRIES:
-                    raise Exception(f"Rate limit retry count exceeded ({self.RATE_LIMIT_MAX_RETRIES})")
-                    
-                delay = self._handle_rate_limit(attempt)
-                time.sleep(delay)
-                
-                # Recursive retry with incremented attempt count
-                return self._api_request_with_backoff(method, endpoint, data, files, attempt + 1)
-            
-            # Other API errors
-            raise
 
     def get_torrent_info(self, torrent_id: str) -> dict:
         """
