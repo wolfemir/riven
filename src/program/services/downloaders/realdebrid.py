@@ -1290,7 +1290,7 @@ class RealDebridDownloader(DownloaderBase):
         return result
 
     def add_torrent(self, stream_or_hash: Union[Stream, str]) -> TorrentAddResult:
-        """Add a torrent to Real-Debrid and select files"""
+        """Add a torrent to Real-brid and select files"""
         try:
             # Handle both Stream object and infohash string
             if isinstance(stream_or_hash, Stream):
@@ -1775,7 +1775,6 @@ class RealDebridDownloader(DownloaderBase):
     def _cleanup_inactive_torrents(self) -> int:
         """Clean up inactive, errored, or stalled torrents to free up slots.
         Returns number of torrents cleaned up."""
-        
         current_time = time.time()
         if (current_time - self.last_cleanup_time) < 60:  # Reduce interval to 1 minute
             return 0
@@ -1897,3 +1896,16 @@ class RealDebridDownloader(DownloaderBase):
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
+
+    def _get_media_file_ids(self, torrent_info: dict) -> List[str]:
+        """Get IDs of media files from torrent info.
+        
+        Args:
+            torrent_info: Torrent information dictionary containing files
+            
+        Returns:
+            List of file IDs for media files
+        """
+        files = torrent_info.get("files", [])
+        processed = self._process_files(files)
+        return list(processed.keys()) if processed else []
