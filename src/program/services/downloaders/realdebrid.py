@@ -10,6 +10,7 @@ import random
 from loguru import logger
 from pydantic import BaseModel
 from requests import Session
+from RTN import parse
 
 from program.media.item import MediaItem
 from program.media.stream import Stream
@@ -510,20 +511,20 @@ class RealDebridDownloader(DownloaderBase):
                             if isinstance(current, dict):
                                 current_status = current.get("status")
                                 if current_status == "downloaded":
-                                    logger.debug(f"Skipping deletion of {download_id} ({filename}): status changed to downloaded")
+                                    logger.debug(f"⏭️ Skipping deletion of {self._color_text(download_id, 'yellow')} ({filename}): {self._color_text('status changed to downloaded', 'green')}")
                                     if content_id:
                                         self.download_complete[content_id] = True
                                     continue
                                 elif current_status == "unknown":
-                                    logger.debug(f"Skipping deletion of {download_id} ({filename}): status is unknown")
+                                    logger.debug(f"⏭️ Skipping deletion of {self._color_text(download_id, 'yellow')} ({filename}): {self._color_text('status is unknown', 'yellow')}")
                                     continue
                         except Exception as e:
-                            logger.debug(f"Failed to double-check download status for {download_id}: {e}")
+                            logger.debug(f"❌ Failed to double-check download status for {self._color_text(download_id, 'red')}: {e}")
                         
                         try:
                             self.api.request_handler.execute(HttpMethod.DELETE, f"downloads/delete/{download_id}")
                             deleted += 1
-                            logger.info(f"Deleted download {download_id} ({filename}): {reason}, status: {status}")
+                            logger.info(f"🗑️ Deleted download {self._color_text(download_id, 'yellow')} ({filename}): {reason}, status: {status}")
                             
                             # Update our tracking
                             if content_id:
@@ -532,7 +533,7 @@ class RealDebridDownloader(DownloaderBase):
                         except Exception as e:
                             if "404" in str(e):
                                 deleted += 1  # Already deleted
-                                logger.debug(f"Download {download_id} was already deleted")
+                                logger.debug(f"🗑️ Download {self._color_text(download_id, 'yellow')} was already deleted")
                                 # Update our tracking
                                 if content_id and download_id in self.active_downloads[content_id]:
                                     self.active_downloads[content_id].remove(download_id)
@@ -566,12 +567,12 @@ class RealDebridDownloader(DownloaderBase):
 
     def _process_files(self, files: List[dict], item: Optional[MediaItem] = None) -> Dict[str, dict]:
         """Process and filter valid video files"""
-        logger.debug(f"Processing {len(files)} files from Real-Debrid")
+        logger.debug(f"🔍 Processing {len(files)} files from Real-Debrid")
         result = {}
         
         # If no files yet, return empty result to trigger retry
         if not files:
-            logger.debug("No files available yet, will retry")
+            logger.debug("⚠️ No files available yet, will retry")
             return {}
         
         # Process all video files
@@ -585,12 +586,12 @@ class RealDebridDownloader(DownloaderBase):
             
             # Skip if no valid ID
             if not file_id:
-                logger.debug(f"✗ Skipped file with no ID: {path}")
+                logger.debug(f"❌ Skipped file with no ID: {path}")
                 continue
         
             # Skip sample files and unwanted files
             if "/sample/" in name.lower() or "sample" in name.lower():
-                logger.debug(f"✗ Skipped sample file: {name}")
+                logger.debug(f"⏭️ Skipped sample file: {name}")
                 continue
             
             if any(name.endswith(f".{ext}") for ext in VIDEO_EXTENSIONS):
@@ -599,25 +600,24 @@ class RealDebridDownloader(DownloaderBase):
                     # Parse episode info from filename
                     try:
                         parsed = parse(name)
-                        if parsed and parsed.season_number is not None and parsed.episode_numbers:
+                        if parsed.seasons and parsed.episodes:
                             # Check if season/episode numbers match
-                            if (parsed.season_number == item.parent.number and 
-                                item.number in parsed.episode_numbers):
+                            if item.parent.number in parsed.seasons and item.number in parsed.episodes:
                                 valid_videos.append(file)
-                                logger.debug(f"✓ Found matching episode: {name} (S{parsed.season_number:02d}E{item.number:02d})")
+                                logger.debug(f"✅ Found matching episode: {name} (S{parsed.seasons[0]:02d}E{item.number:02d})")
                             else:
-                                logger.debug(f"✗ Episode numbers don't match: {name} vs S{item.parent.number:02d}E{item.number:02d}")
+                                logger.debug(f"❌ Episode numbers don't match: {name} vs S{item.parent.number:02d}E{item.number:02d}")
                         else:
-                            logger.debug(f"✗ Could not parse episode info from: {name}")
+                            logger.debug(f"❌ Could not parse episode info from: {name}")
                     except Exception as e:
-                        logger.debug(f"✗ Error parsing episode info from {name}: {e}")
+                        logger.debug(f"⚠️ Error parsing episode info from {name}: {e}")
                 else:
                     # For movies or when no item is provided, include all video files
                     valid_videos.append(file)
-                    logger.debug(f"✓ Found valid video file: {name} (size: {size} bytes, id: {file_id})")
+                    logger.debug(f"✅ Found valid video file: {name} (size: {self._format_size(size)}, id: {file_id})")
             else:
                 # Log why file was rejected
-                logger.debug(f"✗ Skipped non-video file: {name}")
+                logger.debug(f"❌ Skipped non-video file: {name}")
 
         # Sort videos by size (largest first) to ensure main episodes/movies are prioritized
         valid_videos.sort(key=lambda x: x.get("bytes", 0), reverse=True)
@@ -637,17 +637,25 @@ class RealDebridDownloader(DownloaderBase):
                 "filesize": size,
                 "parent_path": parent_path
             }
-            logger.debug(f"✓ Selected file for download: {path} (size: {size} bytes, id: {file_id})")
+            logger.debug(f"📥 Selected file for download: {path} (size: {self._format_size(size)}, id: {file_id})")
 
         if not result:
             # Log all files for debugging
-            logger.debug("No valid video files found. Available files:")
+            logger.debug("❌ No valid video files found. Available files:")
             for file in files:
-                logger.debug(f"- {file.get('path', '')} ({file.get('bytes', 0)} bytes)")
+                logger.debug(f"  • {file.get('path', '')} ({self._format_size(file.get('bytes', 0))})")
         else:
-            logger.debug(f"Selected {len(result)} video files for download")
+            logger.debug(f"✨ Selected {len(result)} video files for download")
 
         return result
+
+    def _format_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f} PB"
 
     def select_files(self, torrent_id: str, file_ids: List[str]) -> bool:
         """Select files for download"""
@@ -754,13 +762,14 @@ class RealDebridDownloader(DownloaderBase):
                 if not info:
                     return DownloadCachedStreamResult(success=False, error="Failed to get torrent info")
 
-                status = info.get("status", "").lower()  # Convert to lowercase for comparison
+                status = info.get("status", "").lower()  # Convert to lowercase
                 filename = info.get("filename", "unknown")
                 progress = info.get("progress", 0)
                 speed = info.get("speed", 0) / 1024 / 1024  # Convert to MB/s
                 seeders = info.get("seeders", 0)
 
-                logger.debug(f"Processing status: {status} for file {filename}")
+                logger.debug(f"📊 {self._format_progress(progress, speed, seeders)}\n"
+                             f"🎬 Processing file: {filename}")
 
                 # For any status, first check if we have valid files
                 files = info.get("files", [])
@@ -777,7 +786,7 @@ class RealDebridDownloader(DownloaderBase):
                     file_ids = list(processed.keys())
                     try:
                         self.select_files(torrent_id, file_ids)
-                        logger.debug(f"Selected files {file_ids} for torrent {torrent_id}")
+                        logger.debug(f"✅ Selected files {file_ids} for torrent {torrent_id}")
                     except Exception as e:
                         return DownloadCachedStreamResult(success=False, error=f"Failed to select files: {e}")
                     
@@ -787,7 +796,7 @@ class RealDebridDownloader(DownloaderBase):
                 elif status == RDTorrentStatus.QUEUED.value:
                     if queue_start_time is None:
                         queue_start_time = current_time
-                        logger.debug(f"{filename} queued for download")
+                        logger.debug(f"⏳ {filename} queued for download")
                     
                     queue_time = current_time - queue_start_time
                     if queue_time > self.QUEUE_TIMEOUT:
@@ -798,7 +807,8 @@ class RealDebridDownloader(DownloaderBase):
 
                 elif status == RDTorrentStatus.DOWNLOADING.value:
                     if progress is not None:
-                        logger.debug(f"{filename} - Progress: {progress}%, Speed: {speed:.2f}MB/s, Seeders: {seeders}")
+                        logger.debug(f"⬇️ {filename}")
+                        logger.debug(f"📊 {self._format_progress(progress, speed, seeders)}")
                         
                         # Calculate timeout based on progress and file size
                         timeout = self._calculate_timeout(info, item)
@@ -824,6 +834,7 @@ class RealDebridDownloader(DownloaderBase):
 
                     # Add processed files to both info and container for compatibility
                     info["processed_files"] = processed
+                    logger.debug(f"✅ Download complete: {filename}")
 
                     return DownloadCachedStreamResult(
                         success=True,
@@ -836,16 +847,16 @@ class RealDebridDownloader(DownloaderBase):
                 elif status in (RDTorrentStatus.ERROR.value, RDTorrentStatus.MAGNET_ERROR.value, RDTorrentStatus.DEAD.value):
                     return DownloadCachedStreamResult(
                         success=False,
-                        error=f"Download failed with status: {status}"
+                        error=f"❌ Download failed with status: {status}"
                     )
 
                 else:
-                    logger.warning(f"Unhandled status: {status}")
+                    logger.warning(f"⚠️ Unhandled status: {status}")
                     last_check_time = current_time
                     continue
 
             except Exception as e:
-                logger.error(f"Error checking download status: {str(e)}")
+                logger.error(f"❌ Error checking download status: {str(e)}")
                 return DownloadCachedStreamResult(success=False, error=f"Error checking status: {str(e)}")
 
             time.sleep(self.STATUS_CHECK_INTERVAL)
@@ -853,13 +864,13 @@ class RealDebridDownloader(DownloaderBase):
     def _add_active_download(self, content_id: str, torrent_id: str):
         """Add a download to active downloads tracking."""
         self.active_downloads[content_id].add(torrent_id)
-        logger.debug(f"Added download {torrent_id} to content {content_id} tracking")
+        logger.debug(f"➕ Added download {self._color_text(torrent_id, 'cyan')} to content {self._color_text(content_id, 'cyan')} tracking")
 
     def _remove_active_download(self, content_id: str, torrent_id: str):
         """Remove a download from active downloads tracking."""
         if content_id in self.active_downloads:
             self.active_downloads[content_id].discard(torrent_id)
-            logger.debug(f"Removed download {torrent_id} from content {content_id} tracking")
+            logger.debug(f"➖ Removed download {self._color_text(torrent_id, 'yellow')} from content {self._color_text(content_id, 'yellow')} tracking")
             if not self.active_downloads[content_id]:
                 del self.active_downloads[content_id]
                 logger.debug(f"Removed empty content {content_id} from tracking")
@@ -867,12 +878,12 @@ class RealDebridDownloader(DownloaderBase):
     def _mark_content_complete(self, content_id: str):
         """Mark a content as having completed download."""
         self.download_complete[content_id] = True
-        logger.debug(f"Marked content {content_id} as complete")
+        logger.debug(f"✨ Marked content {self._color_text(content_id, 'green')} as complete")
 
     def _is_content_complete(self, content_id: str) -> bool:
         """Check if content has completed download."""
         is_complete = content_id in self.download_complete and self.download_complete[content_id]
-        logger.debug(f"Content {content_id} complete status: {is_complete}")
+        logger.debug(f"Content {content_id} complete status: {self._color_text(str(is_complete), 'green' if is_complete else 'yellow')}")
         return is_complete
 
     def validate(self) -> bool:
@@ -941,7 +952,7 @@ class RealDebridDownloader(DownloaderBase):
         try:
             # Check if we're at the active torrent limit
             if not self._can_start_download():
-                logger.debug(f"Active limit exceeded, forcing cleanup (attempt {attempt}/5)")
+                logger.debug(f"🧹 Active limit exceeded, forcing cleanup (attempt {attempt}/5)")
                 if not self._cleanup_if_needed():
                     return None
                 return self.add_torrent(stream, attempt + 1)
@@ -999,7 +1010,7 @@ class RealDebridDownloader(DownloaderBase):
             # First check active torrent count
             try:
                 active_count = self.api.request_handler.execute(HttpMethod.GET, "torrents/activeCount")
-                logger.debug(f"Active torrents: {active_count['nb']}/{active_count['limit']}")
+                logger.debug(f"⚠️ At active torrent limit {self._format_count(active_count['nb'], active_count['limit'])}")
                 if active_count["nb"] < active_count["limit"]:
                     return 0
                 
@@ -1161,7 +1172,7 @@ class RealDebridDownloader(DownloaderBase):
                 magnet_threshold = 300  # 5 minutes
                 time_threshold = self.CLEANUP_INACTIVE_TIME
             
-            logger.debug(f"Using thresholds - Magnet: {magnet_threshold/60:.1f}m, General: {time_threshold/60:.1f}m")
+            logger.debug(f"⏱️ Using thresholds - Magnet: {self._color_text(f'{magnet_threshold/60:.1f}m', 'cyan')}, General: {self._color_text(f'{time_threshold/60:.1f}m', 'cyan')}")
             
             # Process all torrents for cleanup
             for status, torrents in active_by_status.items():
@@ -1522,12 +1533,13 @@ class RealDebridDownloader(DownloaderBase):
             speed_mb = speed / 1000000 if speed else 0  # Convert to MB/s
             
             logger.debug(
-                f"Status: {status}, Progress: {progress}%, Speed: {speed_mb:.2f}MB/s, Seeders: {seeders}"
+                f"📊 {self._format_progress(progress, speed_mb, seeders)}\n"
+                f"🎬 Status: {self._format_status(status)}"
             )
             
             # Log file details if available
             if files:
-                logger.debug("Available files:")
+                logger.debug("📁 Available files:")
                 for f in files:
                     logger.debug(f"- {f.get('path', 'unknown')} ({f.get('bytes', 0)} bytes)")
         
@@ -1575,7 +1587,7 @@ class RealDebridDownloader(DownloaderBase):
             limit = active_count.get("limit", 10)  # Default RealDebrid limit is 10
             
             if current_count >= limit:
-                logger.debug(f"At active torrent limit ({current_count}/{limit})")
+                logger.debug(f"⚠️ At active torrent limit {self._format_count(current_count, limit)}")
                 return False
                 
             return True
@@ -1664,3 +1676,57 @@ class RealDebridDownloader(DownloaderBase):
         )
         
         return timeout
+
+    def _color_text(self, text: str, color: str) -> str:
+        """Add ANSI color to text"""
+        colors = {
+            'red': '\033[91m',
+            'green': '\033[92m',
+            'yellow': '\033[93m',
+            'blue': '\033[94m',
+            'magenta': '\033[95m',
+            'cyan': '\033[96m',
+            'white': '\033[97m',
+            'reset': '\033[0m'
+        }
+        return f"{colors.get(color, '')}{text}{colors['reset']}"
+
+    def _format_status(self, status: str) -> str:
+        """Format status with color"""
+        status = status.upper()
+        color_map = {
+            'DOWNLOADED': 'green',
+            'DOWNLOADING': 'blue',
+            'QUEUED': 'yellow',
+            'WAITING_FILES_SELECTION': 'cyan',
+            'ERROR': 'red',
+            'MAGNET_ERROR': 'red',
+            'DEAD': 'red'
+        }
+        return self._color_text(status, color_map.get(status.lower(), 'white'))
+
+    def _format_progress(self, progress: float, speed: float, seeders: int) -> str:
+        """Format progress info with colors"""
+        progress_color = 'green' if progress >= 90 else 'yellow' if progress >= 50 else 'blue'
+        speed_color = 'green' if speed > 5 else 'yellow' if speed > 1 else 'blue'
+        seeders_color = 'green' if seeders > 10 else 'yellow' if seeders > 0 else 'red'
+        
+        return (
+            f"Progress: {self._color_text(f'{progress:.1f}%', progress_color)}, "
+            f"Speed: {self._color_text(f'{speed:.2f}MB/s', speed_color)}, "
+            f"Seeders: {self._color_text(str(seeders), seeders_color)}"
+        )
+
+    def _format_count(self, current: int, limit: int) -> str:
+        """Format count with color based on how close to limit"""
+        color = 'green' if current < limit * 0.7 else 'yellow' if current < limit * 0.9 else 'red'
+        return self._color_text(f"{current}/{limit}", color)
+
+    def _format_attempt(self, attempt: int, max_attempts: int) -> str:
+        """Format attempt counter with color"""
+        color = 'green' if attempt <= max_attempts/2 else 'yellow' if attempt <= max_attempts*0.8 else 'red'
+        return self._color_text(f"attempt {attempt}/{max_attempts}", color)
+
+    def _format_deletion(self, reason: str) -> str:
+        """Format deletion message"""
+        return self._color_text(f"🗑️ {reason}", 'red')
