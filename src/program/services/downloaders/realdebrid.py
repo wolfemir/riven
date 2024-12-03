@@ -1385,22 +1385,21 @@ class RealDebridDownloader(DownloaderBase):
     def _validate_premium(self) -> bool:
         """Validate premium status"""
         try:
-            user_info = self.api.request_handler.execute(HttpMethod.GET, "user")
-            if not user_info.get("premium"):
-                logger.error("Premium membership required")
+            # Get user account info
+            response = self.api.request_handler.execute(HttpMethod.GET, '/user')
+            
+            if not isinstance(response, dict):
+                logger.error("Invalid response format from Real-Debrid API")
                 return False
-
-            expiration = user_info.get("expiration")
-            if expiration:
-                try:
-                    # Real-Debrid returns ISO format date string
-                    expiry_date = datetime.fromisoformat(expiration.replace('Z', '+00:00'))
-                    days_left = (expiry_date - datetime.now(timezone.utc)).days
-                    logger.info(f"Your account expires in {days_left} days.")
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Could not parse expiration date: {e}")
-
+                
+            # Check premium status
+            premium = response.get('premium', False)
+            if not premium:
+                logger.error("Account is not premium")
+                return False
+                
             return True
+            
         except Exception as e:
             logger.error(f"Failed to validate premium status: {e}")
             return False
