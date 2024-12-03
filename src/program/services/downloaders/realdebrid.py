@@ -77,250 +77,67 @@ class InvalidFileIDError(RealDebridError):
     pass
 
 class RealDebridRateLimiter:
-    """Thread-safe rate limiter for Real-Debrid API requests."""
+    """Rate limiter for Real-Debrid API with exponential backoff."""
     
-    def __init__(self, requests_per_minute: int = 90):
-        self.requests_per_minute = requests_per_minute
-        self.request_count = 0
-        self.last_reset = time.time()
+    def __init__(self, max_requests: int = 90, time_window: int = 60):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = []
         self._lock = threading.Lock()
-        self._running = True
-        self.backoff_time = 0
-        self.consecutive_failures = 0
-        self._start_reset_thread()
-        self._last_request_time = 0
-        self.min_request_interval = 60.0 / requests_per_minute  # Minimum time between requests
-    
-    def _start_reset_thread(self):
-        """Start background thread to reset request counter."""
-        def reset_counter():
-            while self._running:
-                time.sleep(60)  # Wait for 1 minute
-                with self._lock:
-                    current_time = time.time()
-                    if current_time - self.last_reset >= 60:
-                        logger.debug(f"🔄 Resetting rate limit counter (was {self.request_count})")
-                        self.request_count = 0
-                        self.last_reset = current_time
-                        # Reset backoff if we've gone a full minute without issues
-                        if self.consecutive_failures > 0:
-                            self.consecutive_failures = max(0, self.consecutive_failures - 1)
-                            if self.consecutive_failures == 0:
-                                self.backoff_time = 0
+        self.backoff_until = 0
+        self.consecutive_errors = 0
         
-        self._reset_thread = threading.Thread(target=reset_counter, daemon=True)
-        self._reset_thread.start()
-    
-    def acquire(self, wait: bool = True) -> bool:
-        """
-        Acquire permission to make an API request with exponential backoff.
-        Args:
-            wait: If True, wait until a request slot is available
-        Returns:
-            True if request is allowed, False if rate limit reached and wait=False
-        """
-        while True:
-            with self._lock:
-                current_time = time.time()
-                
-                # Enforce minimum interval between requests
-                time_since_last = current_time - self._last_request_time
-                if time_since_last < self.min_request_interval:
-                    sleep_time = self.min_request_interval - time_since_last
-                    if not wait:
-                        return False
-                    time.sleep(sleep_time)
-                    continue
-                
-                # If we're in backoff period, wait
-                if self.backoff_time > current_time:
-                    if not wait:
-                        logger.warning("❌ In backoff period and wait=False")
-                        return False
-                    backoff_remaining = self.backoff_time - current_time
-                    logger.debug(f"⏳ In backoff period, waiting {backoff_remaining:.1f}s...")
-                    time.sleep(min(backoff_remaining, 1))
-                    continue
-                
-                # Reset counter if minute has passed
-                if current_time - self.last_reset >= 60:
-                    logger.debug(f"🔄 Resetting rate limit counter (was {self.request_count})")
-                    self.request_count = 0
-                    self.last_reset = current_time
-                
-                # Check if we can make a request
-                if self.request_count < self.requests_per_minute:
-                    self.request_count += 1
-                    self._last_request_time = current_time
-                    logger.debug(f"✅ Rate limit request approved ({self.request_count}/{self.requests_per_minute})")
-                    return True
-                
-                if not wait:
-                    logger.warning("❌ Rate limit reached and wait=False")
-                    return False
-            
-            # Calculate wait time with jitter
-            jitter = random.uniform(0.8, 1.2)  # Reduced jitter range
-            wait_time = (60 - (current_time - self.last_reset)) * jitter
-            wait_time = min(max(0.1, wait_time), 5)  # Bound between 0.1 and 5 seconds
-            time.sleep(wait_time)
-    
-    def handle_error(self):
-        """Handle rate limit error by increasing backoff time."""
-        with self._lock:
-            self.consecutive_failures += 1
-            # Exponential backoff with max of 1 hour
-            backoff = min(60 * 60, 5 * (2 ** self.consecutive_failures))
-            self.backoff_time = time.time() + backoff
-            logger.warning(f"⚠️ Rate limit error, backing off for {backoff:.1f}s")
-    
-    def mark_failure(self):
-        """Mark a rate limit failure and implement exponential backoff"""
-        with self._lock:
-            self.consecutive_failures += 1
-            # Calculate backoff time: 2^failures seconds with max of 5 minutes
-            backoff = min(2 ** self.consecutive_failures, 300)
-            self.backoff_time = time.time() + backoff
-            logger.warning(f"⚠️ Rate limit failure #{self.consecutive_failures}, backing off for {backoff}s")
-
-    def mark_success(self):
-        """Mark a successful request to reduce backoff"""
-        with self._lock:
-            if self.consecutive_failures > 0:
-                self.consecutive_failures = max(0, self.consecutive_failures - 1)
-                if self.consecutive_failures == 0:
-                    self.backoff_time = 0
-                    logger.debug("✅ Reset backoff after successful request")
-    
-    def shutdown(self):
-        """Stop the reset thread."""
-        self._running = False
-        if self._reset_thread:
-            self._reset_thread.join(timeout=1)
-
     def __enter__(self):
-        """Enter the context manager by acquiring a rate limit slot"""
         self.acquire()
-        return self
-    
+        
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit the context manager and mark success/failure based on exception"""
         if exc_type is not None:
-            self.handle_error()
-        else:
-            self.mark_success()
-
-class DownloadManager:
-    """Manages concurrent downloads and threads"""
-    def __init__(self, max_concurrent: int = 5):
-        self.max_concurrent = max_concurrent
-        self.active_downloads = 0
-        self._lock = threading.Lock()
-        self._download_complete = threading.Event()
-        self.active_torrents = {}  # Track active torrents by ID
+            if "rate limit exceeded" in str(exc_val).lower():
+                self.handle_error()
         
-    def wait_for_slot(self, timeout: Optional[float] = None) -> bool:
-        """Wait until a download slot is available.
-        
-        Args:
-            timeout: Maximum time to wait in seconds, or None to wait indefinitely
-            
-        Returns:
-            bool: True if slot acquired, False if timeout occurred
-        """
-        start_time = time.time()
-        while True:
-            with self._lock:
-                if self.active_downloads < self.max_concurrent:
-                    self.active_downloads += 1
-                    logger.debug(f"✅ Download slot acquired ({self.active_downloads}/{self.max_concurrent})")
-                    return True
-            
-            if timeout is not None:
-                if time.time() - start_time > timeout:
-                    logger.warning("❌ Timeout waiting for download slot")
-                    return False
-            
-            logger.debug("⏳ Waiting for download slot...")
-            time.sleep(1)
-            
-    def release_slot(self, torrent_id: Optional[str] = None):
-        """Release a download slot and cleanup torrent tracking.
-        
-        Args:
-            torrent_id: Optional torrent ID to remove from tracking
-        """
+    def acquire(self):
+        """Acquire permission to make a request."""
         with self._lock:
-            self.active_downloads = max(0, self.active_downloads - 1)
-            if torrent_id and torrent_id in self.active_torrents:
-                del self.active_torrents[torrent_id]
+            current_time = time.time()
             
-            if self.active_downloads == 0:
-                self._download_complete.set()
-                logger.debug("✨ All downloads complete")
-            else:
-                logger.debug(f"📊 Active downloads: {self.active_downloads}/{self.max_concurrent}")
-    
-    def add_torrent(self, torrent_id: str, info: dict):
-        """Track a new active torrent.
-        
-        Args:
-            torrent_id: The torrent ID
-            info: Torrent information dictionary
-        """
+            # First check if we're in backoff
+            if current_time < self.backoff_until:
+                wait_time = self.backoff_until - current_time
+                logger.debug(f"Still in backoff period, waiting {wait_time:.1f}s")
+                time.sleep(wait_time)
+            
+            # Clean old requests
+            self.requests = [t for t in self.requests if current_time - t < self.time_window]
+            
+            # Check if we can make a request
+            if len(self.requests) >= self.max_requests:
+                oldest_request = min(self.requests)
+                wait_time = oldest_request + self.time_window - current_time
+                if wait_time > 0:
+                    logger.debug(f"Rate limit reached, waiting {wait_time:.1f}s")
+                    time.sleep(wait_time)
+                    # Clean old requests again after waiting
+                    current_time = time.time()
+                    self.requests = [t for t in self.requests if current_time - t < self.time_window]
+            
+            # Add the new request
+            self.requests.append(current_time)
+            logger.debug(f"✅ Rate limit request approved ({len(self.requests)}/{self.max_requests})")
+            
+    def handle_error(self):
+        """Handle a rate limit error with exponential backoff."""
         with self._lock:
-            self.active_torrents[torrent_id] = {
-                'info': info,
-                'start_time': time.time(),
-                'last_progress': 0,
-                'stalled_time': 0
-            }
-    
-    def update_torrent(self, torrent_id: str, info: dict) -> bool:
-        """Update torrent progress and check for stalled downloads.
-        
-        Args:
-            torrent_id: The torrent ID
-            info: Updated torrent information
+            self.consecutive_errors += 1
+            backoff_time = min(2 ** self.consecutive_errors, 30)  # Cap at 30 seconds
+            self.backoff_until = time.time() + backoff_time
+            logger.warning(f"⚠️ Rate limit error, backing off for {backoff_time:.1f}s")
             
-        Returns:
-            bool: True if download is progressing normally
-        """
+    def reset(self):
+        """Reset the rate limiter state."""
         with self._lock:
-            if torrent_id not in self.active_torrents:
-                return True
-                
-            data = self.active_torrents[torrent_id]
-            current_progress = info.get('progress', 0)
-            
-            # Check if progress has improved
-            if current_progress > data['last_progress']:
-                data['stalled_time'] = 0
-                data['last_progress'] = current_progress
-                return True
-            
-            # Calculate stalled time
-            elapsed = time.time() - data['start_time']
-            data['stalled_time'] = elapsed
-            
-            # Return False if stalled for too long
-            return data['stalled_time'] < 300  # 5 minutes
-    
-    def get_active_torrents(self) -> Dict[str, dict]:
-        """Get copy of active torrents dictionary."""
-        with self._lock:
-            return self.active_torrents.copy()
-    
-    def wait_for_completion(self, timeout: Optional[float] = None) -> bool:
-        """Wait for all downloads to complete.
-        
-        Args:
-            timeout: Maximum time to wait in seconds
-            
-        Returns:
-            bool: True if all downloads completed, False if timeout occurred
-        """
-        return self._download_complete.wait(timeout=timeout)
+            self.requests = []
+            self.consecutive_errors = 0
+            self.backoff_until = 0
 
 class RealDebridAPI:
     """Real-Debrid API client with rate limiting and error handling."""
@@ -381,11 +198,17 @@ class RealDebridAPI:
                             args[1] = endpoint
                         return original_execute(*args, **kwargs)
                 except Exception as e:
-                    if "rate limit exceeded" in str(e).lower():
+                    error_str = str(e)
+                    if "404" in error_str:
+                        # Don't retry 404s - resource doesn't exist
+                        raise
+                    elif "rate limit exceeded" in error_str.lower():
                         retry_count += 1
                         self.rate_limiter.handle_error()
                         if retry_count < max_retries:
-                            time.sleep(2 ** retry_count)  # Exponential backoff
+                            backoff_time = min(2 ** retry_count, 30)  # Cap at 30 seconds
+                            logger.debug(f"Rate limit hit, backing off for {backoff_time}s (attempt {retry_count}/{max_retries})")
+                            time.sleep(backoff_time)
                             continue
                     raise
             raise RealDebridError("Max retries exceeded for rate limited request")
@@ -457,8 +280,24 @@ class RealDebridAPI:
         )
 
 class RealDebridRequestHandler(BaseRequestHandler):
-    def __init__(self, session: Session, base_url: str, request_logging: bool = False):
-        super().__init__(session, response_type=ResponseType.DICT, base_url=base_url, custom_exception=RealDebridError, request_logging=request_logging)
+    def handle_response(self, response: Response) -> Any:
+        """Handle the API response with proper error handling."""
+        try:
+            if response.status_code == 404:
+                raise RealDebridError(f"Resource not found: {response.url}")
+            elif response.status_code == 403:
+                raise RealDebridError("Account locked or permission denied")
+            elif response.status_code == 401:
+                raise RealDebridError("API token expired or invalid")
+            elif response.status_code == 429:
+                retry_after = response.headers.get('Retry-After', '60')
+                raise RealDebridError(f"Rate limit exceeded. Retry after {retry_after}s")
+            
+            response.raise_for_status()
+            return response.json() if response.content else None
+            
+        except JSONDecodeError:
+            raise RealDebridError(f"Invalid JSON response: {response.text}")
 
     def execute(self, method: HttpMethod, endpoint: str, **kwargs) -> Union[dict, list]:
         response = super()._request(method, endpoint, **kwargs)
