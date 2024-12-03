@@ -1303,7 +1303,7 @@ class RealDebridDownloader(DownloaderBase):
             
             # Add the torrent
             result = self._add_magnet_or_torrent(magnet=magnet)
-            if not result or not result.success:
+            if not result or not result.torrent_id:
                 error_msg = "Failed to add magnet" if not result else result.error
                 return TorrentAddResult(success=False, error=error_msg, torrent_id="", info={})
 
@@ -1640,239 +1640,52 @@ class RealDebridDownloader(DownloaderBase):
                     
                     # Check for stalled downloads
                     if status == "downloading":
-                        if t["speed"] < min_speed_threshold:
-                            time_stalled = t["time_elapsed"]
-                            if time_stalled > stalled_threshold:
-                                reason = (f"stalled download: {t['filename']} "
-                                        f"(progress: {t['progress']}%, "
-                                        f"speed: {t['speed']/1024:.1f} KB/s, "
-                                        f"stalled for: {time_stalled/60:.1f}m)")
-                                priority = 120 if t["progress"] < 10 else 100  # Higher priority for early stalls
-                                to_delete.append((priority, t["id"], reason, time_stalled))
-                                logger.info(f"Marking stalled download for deletion: {reason}")
+                        # No seeders and no progress for 2 minutes
+                        if t["speed"] == 0 and t["seeders"] == 0:
+                            if t["time_elapsed"] > 120:  # Reduced from 300s to 120s
+                                reason = f"stalled with no seeders (file: {t['filename']}, progress: {t['progress']}%)"
+                                to_delete.append((90, t["id"], reason))
+                        # Extremely slow downloads
+                        elif t["speed"] < self.CLEANUP_SPEED_THRESHOLD:
+                            if t["time_elapsed"] > 300:  # Reduced from 900s to 300s
+                                speed_kb = t["speed"] / 1024
+                                reason = f"extremely slow ({speed_kb:.1f} KB/s) (file: {t['filename']}, progress: {t['progress']}%)"
+                                to_delete.append((80, t["id"], reason))
+                        # No progress in 5 minutes
+                        elif t["progress"] == 0 and t["time_elapsed"] > 300:
+                            reason = f"no progress in 5 minutes (file: {t['filename']})"
+                            to_delete.append((85, t["id"], reason))
                     
-                    # Handle stuck magnet conversions more aggressively
-                    elif status == "magnet_conversion":
-                        if t["time_elapsed"] > 300:  # 5 minutes
-                            reason = f"stuck in magnet conversion for {t['time_elapsed']/60:.1f} minutes"
-                            to_delete.append((130, t["id"], reason, t["time_elapsed"]))
-                            logger.info(f"Marking stuck magnet for deletion: {reason}")
-            
-            # Log active torrent distribution and detailed stats
-            logger.info("=== Active Torrent Stats ===")
-            for status, active_torrents in active_by_status.items():
-                count = len(active_torrents)
-                logger.info(f"\n{status.upper()} ({count} torrents):")
+                    # Check for stuck magnet conversions
+                    elif status == "magnet_conversion" and t["time_elapsed"] > 300:  # Reduced from 600s to 300s
+                        reason = f"stuck in magnet conversion for {t['time_elapsed']:.0f}s"
+                        to_delete.append((70, t["id"], reason))
                 
-                # Sort by time elapsed
-                active_torrents.sort(key=lambda x: x["time_elapsed"], reverse=True)
-                
-                for t in active_torrents:
-                    stats = []
-                    if t["progress"] > 0:
-                        stats.append(f"progress: {t['progress']}%")
-                    if t["speed"] > 0:
-                        stats.append(f"speed: {t['speed']/1024:.1f} KB/s")
-                    if t["seeders"] > 0:
-                        stats.append(f"seeders: {t['seeders']}")
-                    if t["time_elapsed"] > 0:
-                        stats.append(f"age: {t['time_elapsed']/60:.1f}m")
-                    
-                    stats_str = ", ".join(stats) if stats else f"age: {t['time_elapsed']/60:.1f}m"
-                    logger.info(f"  - {t['filename']} ({stats_str})")
-            
-            # Calculate duplicate ratio and adjust aggressiveness
-            unique_filenames = set()
-            for status, torrents in active_by_status.items():
-                for t in torrents:
-                    unique_filenames.add(t["filename"])
-            
-            duplicate_ratio = (total_active - len(unique_filenames)) / total_active if total_active > 0 else 0
-            if duplicate_ratio > 0.5:  # If more than 50% are duplicates
-                extremely_aggressive = True
-                logger.info(f"High duplicate ratio ({duplicate_ratio:.1%}), using extremely aggressive cleanup")
-            
-            # Set base thresholds
-            if extremely_aggressive:
-                magnet_threshold = 30  # 30 seconds
-                time_threshold = self.CLEANUP_INACTIVE_TIME / 4
-            elif aggressive_cleanup:
-                magnet_threshold = 60  # 1 minute
-                time_threshold = self.CLEANUP_INACTIVE_TIME / 2
-            else:
-                magnet_threshold = 300  # 5 minutes
-                time_threshold = self.CLEANUP_INACTIVE_TIME
-            
-            logger.debug(f"⏱️ Using thresholds - Magnet: {self._color_text(f'{magnet_threshold/60:.1f}m', 'cyan')}, General: {self._color_text(f'{time_threshold/60:.1f}m', 'cyan')}")
-            
-            # Process all torrents for cleanup
-            for status, torrents in active_by_status.items():
-                for torrent_stats in torrents:
-                    should_delete = False
-                    reason = ""
-                    priority = 0
-                    time_elapsed = torrent_stats["time_elapsed"]
-                    
-                    # 1. Error states (highest priority)
-                    if status in ("error", "magnet_error", "virus", "dead"):
-                        should_delete = True
-                        reason = f"error status: {status}"
-                        priority = 100
-                    
-                    # 2. Magnet conversion (high priority if taking too long)
-                    elif status == "magnet_conversion":
-                        if time_elapsed > magnet_threshold:
-                            should_delete = True
-                            reason = f"stuck in magnet conversion for {time_elapsed/60:.1f} minutes"
-                            priority = 95  # Very high priority since we have so many
-                    
-                    # 3. Stalled or slow downloads
-                    elif status == "downloading":
-                        progress = torrent_stats["progress"]
-                        speed = torrent_stats["speed"]
-                        seeders = torrent_stats["seeders"]
+                    # Check for stuck waiting for selection
+                    elif status == "waiting_files_selection" and t["time_elapsed"] > 120:  # New check
+                        reason = f"stuck waiting for file selection for {t['time_elapsed']:.0f}s"
+                        to_delete.append((75, t["id"], reason))
+        
+            # Handle duplicates - only if we're being aggressive
+            if aggressive_cleanup:
+                for filename, dupes in filename_to_torrents.items():
+                    if len(dupes) > 1:
+                        # Sort by progress (highest first), then by speed, then by seeders
+                        dupes.sort(key=lambda x: (x["progress"], x["speed"], x["seeders"]), reverse=True)
+                        best = dupes[0]
                         
-                        if progress == 0 and time_elapsed > time_threshold:
-                            should_delete = True
-                            reason = f"no progress after {time_elapsed/60:.1f} minutes"
-                            priority = 85
-                        elif progress < self.CLEANUP_MINIMAL_PROGRESS_THRESHOLD and time_elapsed > time_threshold:
-                            should_delete = True
-                            reason = f"minimal progress ({progress}%) after {time_elapsed/60:.1f} minutes"
-                            priority = 80
-                        elif speed < self.CLEANUP_SPEED_THRESHOLD:
-                            should_delete = True
-                            reason = f"slow speed ({speed/1024:.1f} KB/s)"
-                            priority = 75
-                        elif seeders == 0:
-                            should_delete = True
-                            reason = f"no seeders"
-                            priority = 85
-                    
-                    # 4. Stuck uploads/compression
-                    elif status in ("uploading", "compressing"):
-                        speed = torrent_stats["speed"]
-                        if time_elapsed > time_threshold or speed < self.CLEANUP_SPEED_THRESHOLD:
-                            should_delete = True
-                            reason = f"stuck in {status} for {time_elapsed/60:.1f} minutes"
-                            priority = 60
-                    
-                    # 5. Other states
-                    elif status in ("waiting_files_selection", "queued"):
-                        if time_elapsed > time_threshold:
-                            should_delete = True
-                            reason = f"stuck in {status} for {time_elapsed/60:.1f} minutes"
-                            priority = 50
-                    
-                    if should_delete:
-                        filename = torrent_stats["filename"]
-                        progress = torrent_stats["progress"]
-                        speed = torrent_stats["speed"]
-                        full_reason = f"{reason} (file: {filename}, progress: {progress}%, speed: {speed/1024:.1f} KB/s)"
-                        to_delete.append((priority, torrent_stats["id"], full_reason, time_elapsed))
+                        # Delete all duplicates except the best one
+                        for dupe in dupes[1:]:
+                            reason = f"duplicate of {best['filename']} ({best['progress']}% vs {dupe['progress']}%)"
+                            to_delete.append((60, dupe["id"], reason))
             
-            # Sort by priority (highest first) and extract torrent_id and reason
-            to_delete.sort(reverse=True)
-            
-            # If we're extremely aggressive, take more torrents
-            batch_size = self.CLEANUP_BATCH_SIZE * 2 if extremely_aggressive else self.CLEANUP_BATCH_SIZE
-            
-            # If no torrents were marked for deletion but we're still over limit,
-            # force delete the slowest/least progressed torrents
-            if not to_delete and total_active > active_count["limit"]:
-                logger.info("No torrents met deletion criteria but still over limit, using fallback cleanup")
+            # Sort by priority (highest first) and delete
+            if to_delete:
+                to_delete.sort(reverse=True)
+                delete_batch = [(t[1], t[2]) for t in to_delete]  # Convert to (id, reason) tuples
+                cleaned = self._batch_delete_torrents(delete_batch)
                 
-                # First try to clean up just duplicates
-                duplicates_only = True
-                cleanup_attempts = 2  # Try duplicates first, then all torrents if needed
-                
-                while cleanup_attempts > 0:
-                    # Collect all active torrents into a single list for sorting
-                    all_active = []
-                    seen_filenames = set()
-                    
-                    for status, torrents in active_by_status.items():
-                        for t in torrents:
-                            filename = t["filename"]
-                            
-                            # Skip non-duplicates on first pass
-                            is_duplicate = filename in seen_filenames
-                            if duplicates_only and not is_duplicate:
-                                continue
-                            
-                            seen_filenames.add(filename)
-                            
-                            score = 0
-                            # Prioritize keeping torrents with more progress
-                            score += t["progress"] * 100
-                            # And those with higher speeds
-                            score += min(t["speed"] / 1024, 1000)  # Cap speed bonus at 1000
-                            # And those with more seeders
-                            score += t["seeders"] * 10
-                            # Penalize older torrents slightly
-                            score -= min(t["time_elapsed"] / 60, 60)  # Cap age penalty at 60 minutes
-                            # Heavy penalty for duplicates
-                            if is_duplicate:
-                                score -= 5000  # Ensure duplicates are cleaned up first
-                            
-                            all_active.append({
-                                "id": t["id"],
-                                "score": score,
-                                "stats": t,
-                                "status": status,
-                                "is_duplicate": is_duplicate
-                            })
-                    
-                    if all_active:
-                        # Sort by score (lowest first - these will be deleted)
-                        all_active.sort(key=lambda x: x["score"])
-                        
-                        # Take enough torrents to get under the limit
-                        to_remove = min(
-                            len(all_active),  # Don't try to remove more than we have
-                            total_active - active_count["limit"] + 1  # +1 for safety margin
-                        )
-                        
-                        for torrent in all_active[:to_remove]:
-                            stats = torrent["stats"]
-                            reason = (f"fallback cleanup{' (duplicate)' if duplicates_only else ''} - {torrent['status']} "
-                                    f"(progress: {stats['progress']}%, "
-                                    f"speed: {stats['speed']/1024:.1f} KB/s, "
-                                    f"seeders: {stats['seeders']}, "
-                                    f"age: {stats['time_elapsed']/60:.1f}m)")
-                            to_delete.append((0, torrent["id"], reason, stats["time_elapsed"]))
-                            logger.info(f"Fallback cleanup marking: {stats['filename']} - {reason}")
-                        
-                        # If we found enough torrents to delete, we're done
-                        if len(to_delete) >= (total_active - active_count["limit"]):
-                            break
-                    
-                    # If we get here and duplicates_only is True, try again with all torrents
-                    duplicates_only = False
-                    cleanup_attempts -= 1
-                
-                # Log what we're about to delete
-                if to_delete:
-                    logger.info(f"Found {len(to_delete)} torrents to clean up, processing in batches of {batch_size}")
-                    for _, _, reason, _ in to_delete[:5]:  # Log first 5 for debugging
-                        logger.debug(f"Will delete: {reason}")
-            
-            # Convert to final format
-            to_delete = [(t[1], t[2]) for t in to_delete]
-            
-            # Process deletion in batches
-            while to_delete:
-                batch = to_delete[:batch_size]
-                to_delete = to_delete[batch_size:]
-                cleaned += self._batch_delete_torrents(batch)
-            
-            # Update last cleanup time if any torrents were cleaned
-            if cleaned > 0:
-                self.last_cleanup_time = datetime.now()
-                logger.info(f"Cleaned up {cleaned} torrents")
-            else:
-                logger.warning("No torrents were cleaned up despite being over the limit!")
-            
+            self.last_cleanup_time = datetime.now()
             return cleaned
             
         except Exception as e:
@@ -2109,7 +1922,7 @@ class RealDebridDownloader(DownloaderBase):
         Returns number of torrents cleaned up."""
         
         current_time = time.time()
-        if (current_time - self.last_cleanup_time) < self.cleanup_interval:
+        if (current_time - self.last_cleanup_time) < 60:  # Reduce interval to 1 minute
             return 0
             
         try:
@@ -2176,24 +1989,33 @@ class RealDebridDownloader(DownloaderBase):
                 # Track potential duplicates
                 filename_to_torrents[torrent_stats["filename"]].append(torrent_stats)
                 
-                # Check for stalled downloads
+                # Check for stalled downloads - More aggressive thresholds
                 if status == "downloading":
-                    # Only consider a download stalled if it has no seeders and no progress
+                    # No seeders and no progress for 2 minutes
                     if torrent_stats["speed"] == 0 and torrent_stats["seeders"] == 0:
-                        if time_elapsed > 300:  # 5 minutes
+                        if time_elapsed > 120:  # Reduced from 300s to 120s
                             reason = f"stalled with no seeders (file: {torrent_stats['filename']}, progress: {torrent_stats['progress']}%)"
                             to_delete.append((90, torrent_stats["id"], reason))
-                    # Or if it's moving extremely slowly
+                    # Extremely slow downloads
                     elif torrent_stats["speed"] < self.CLEANUP_SPEED_THRESHOLD:
-                        if time_elapsed > 900:  # 15 minutes
+                        if time_elapsed > 300:  # Reduced from 900s to 300s
                             speed_kb = torrent_stats["speed"] / 1024
                             reason = f"extremely slow ({speed_kb:.1f} KB/s) (file: {torrent_stats['filename']}, progress: {torrent_stats['progress']}%)"
                             to_delete.append((80, torrent_stats["id"], reason))
+                    # No progress in 5 minutes
+                    elif torrent_stats["progress"] == 0 and time_elapsed > 300:
+                        reason = f"no progress in 5 minutes (file: {torrent_stats['filename']})"
+                        to_delete.append((85, torrent_stats["id"], reason))
                 
                 # Check for stuck magnet conversions
-                elif status == "magnet_conversion" and time_elapsed > 600:  # 10 minutes
+                elif status == "magnet_conversion" and time_elapsed > 300:  # Reduced from 600s to 300s
                     reason = f"stuck in magnet conversion for {time_elapsed:.0f}s"
                     to_delete.append((70, torrent_stats["id"], reason))
+                
+                # Check for stuck waiting for selection
+                elif status == "waiting_files_selection" and time_elapsed > 120:  # New check
+                    reason = f"stuck waiting for file selection for {time_elapsed:.0f}s"
+                    to_delete.append((75, torrent_stats["id"], reason))
         
             # Handle duplicates - only if we're being aggressive
             if aggressive_cleanup:
@@ -2203,96 +2025,20 @@ class RealDebridDownloader(DownloaderBase):
                         dupes.sort(key=lambda x: (x["progress"], x["speed"], x["seeders"]), reverse=True)
                         best = dupes[0]
                         
-                        # Only remove duplicates if they're significantly worse
+                        # Delete all duplicates except the best one
                         for dupe in dupes[1:]:
-                            # Keep both if they're both making good progress
-                            if dupe["progress"] > 20 and dupe["speed"] > self.CLEANUP_SPEED_THRESHOLD:
-                                continue
-                                
-                            reason = (f"duplicate of {filename} "
-                                    f"(keeping: {best['progress']}% @ {best['speed']/1024:.1f} KB/s with {best['seeders']} seeders, "
-                                    f"removing: {dupe['progress']}% @ {dupe['speed']/1024:.1f} KB/s with {dupe['seeders']} seeders)")
+                            reason = f"duplicate of {best['filename']} ({best['progress']}% vs {dupe['progress']}%)"
                             to_delete.append((60, dupe["id"], reason))
-        
-            # Sort by priority and delete
-            to_delete.sort(reverse=True)
             
-            # Determine how many torrents to delete
-            delete_count = len(to_delete)
-            if extremely_aggressive:
-                delete_count = max(delete_count, min(5, len(torrents)))
-            elif aggressive_cleanup:
-                delete_count = max(delete_count, min(3, len(torrents)))
-            
-            # Delete torrents
-            for _, torrent_id, reason in to_delete[:delete_count]:
-                try:
-                    self.api.request_handler.execute(HttpMethod.DELETE, f"torrents/delete/{torrent_id}")
-                    cleaned += 1
-                    logger.info(f"Cleaned up torrent: {reason}")
-                except Exception as e:
-                    logger.error(f"Failed to delete torrent {torrent_id}: {e}")
-        
-            self.last_cleanup_time = datetime.now()
-            if cleaned:
-                logger.info(f"🧹 Cleaned up {cleaned} inactive torrents")
+            # Sort by priority (highest first) and delete
+            if to_delete:
+                to_delete.sort(reverse=True)
+                delete_batch = [(t[1], t[2]) for t in to_delete]  # Convert to (id, reason) tuples
+                cleaned = self._batch_delete_torrents(delete_batch)
+                
+            self.last_cleanup_time = current_time
             return cleaned
             
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             return 0
-
-    def download_cached_stream(self, item: MediaItem, stream: Stream) -> DownloadCachedStreamResult:
-        """Download a stream from Real-Debrid with sequential parallel checking"""
-        content_id = item.id if item else None
-        
-        # Check if content is already complete
-        if self._is_content_complete(content_id):
-            logger.debug(f"Content {content_id} already complete")
-            return DownloadCachedStreamResult(success=True, error=None, torrent_id="", info={})
-        
-        # Get alternative streams to try if the main one fails
-        alternative_streams = self._get_alternative_streams(item, stream)
-        all_streams = [stream] + alternative_streams
-        
-        # Try each stream in sequence
-        for i, current_stream in enumerate(all_streams):
-            if i > 0:
-                logger.debug(f"📥 Trying alternative torrent {i}/{len(alternative_streams)}...")
-                
-            # Check if we can start a new download
-            if not self._can_start_download(content_id):
-                logger.warning(f"Too many active downloads for {content_id}")
-                return DownloadCachedStreamResult(success=False, error=f"Too many active downloads for {content_id}")
-                
-            try:
-                # Try to add and process the torrent
-                if self._try_download_stream(current_stream, item):
-                    return DownloadCachedStreamResult(success=True, error=None, torrent_id="", info={})
-                    
-            except Exception as e:
-                logger.error(f"Error downloading stream {current_stream.id}: {e}")
-                continue
-                
-        return DownloadCachedStreamResult(success=False, error="No torrents downloaded successfully")
-
-    def _try_download_stream(self, stream: Stream, item: MediaItem) -> bool:
-        """Try to download a stream"""
-        # Construct magnet link from infohash
-        magnet = f"magnet:?xt=urn:btih:{stream.infohash}"
-        result = self._add_magnet_or_torrent(magnet=magnet)
-        if not result:
-            return False
-        
-        # Get torrent info
-        torrent_info = self._get_torrent_info(result.torrent_id)
-        if not torrent_info:
-            return False
-        
-        # Select files
-        file_ids = self._get_media_file_ids(torrent_info)
-        if not file_ids:
-            return False
-        
-        # Download the torrent
-        return self.wait_for_download(result.torrent_id, item.id, item, stream)
