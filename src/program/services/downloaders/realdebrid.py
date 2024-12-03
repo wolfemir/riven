@@ -325,6 +325,15 @@ class DownloadManager:
 class RealDebridAPI:
     """Real-Debrid API client with rate limiting and error handling."""
     
+    # API endpoints
+    ENDPOINTS = {
+        'torrents': 'torrents',
+        'torrents_active': 'torrents/active',
+        'torrents_info': 'torrents/info',
+        'torrents_completed': 'torrents/completed',
+        'unrestrict': 'unrestrict/link'
+    }
+    
     def __init__(self, api_key: str, proxy_url: Optional[str] = None):
         self.api_key = api_key
         self.proxy_url = proxy_url
@@ -355,6 +364,11 @@ class RealDebridAPI:
             while retry_count < max_retries:
                 try:
                     with self.rate_limiter:
+                        # Ensure endpoint starts with a single slash and has no trailing slash
+                        if len(args) > 1 and isinstance(args[1], str):
+                            endpoint = args[1].strip('/')
+                            args = list(args)
+                            args[1] = endpoint
                         return original_execute(*args, **kwargs)
                 except Exception as e:
                     if "rate limit exceeded" in str(e).lower():
@@ -491,12 +505,12 @@ class RealDebridDownloader(DownloaderBase):
                 return 0
 
             # Get current torrents
-            torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
+            torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
             if not torrents:
                 return 0
 
             # Get current downloads
-            downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
 
             # Get active torrents by status
             active_by_status = defaultdict(list)
@@ -679,7 +693,7 @@ class RealDebridDownloader(DownloaderBase):
         deleted = 0
         # Get all downloads in one request to minimize API calls
         try:
-            downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
             downloads_by_torrent = {}
             for download in downloads:
                 torrent_id = download.get("torrent_id")
@@ -735,7 +749,7 @@ class RealDebridDownloader(DownloaderBase):
             return 0
             
         try:
-            downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
             if not isinstance(downloads, list):
                 logger.error(f"Unexpected downloads response type: {type(downloads)}")
                 return 0
@@ -744,7 +758,7 @@ class RealDebridDownloader(DownloaderBase):
             
             # Get current torrents for reference
             try:
-                torrents = {t["id"]: t for t in self.api.request_handler.execute(HttpMethod.GET, "torrents")}
+                torrents = {t["id"]: t for t in self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])}
             except Exception as e:
                 logger.warning(f"Failed to get torrents list for reference: {e}")
                 torrents = {}
@@ -1009,7 +1023,7 @@ class RealDebridDownloader(DownloaderBase):
                 logger.debug(f"Using cached active torrents list ({len(active_torrents)})")
             else:
                 # Get active torrents with a single request
-                active_info = self.api.request_handler.execute(HttpMethod.GET, '/torrents/active')
+                active_info = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_active'])
                 active_torrents = active_info.get('torrents', [])
                 # Update cache
                 self._active_torrents_cache = active_torrents
@@ -1071,7 +1085,7 @@ class RealDebridDownloader(DownloaderBase):
         """Finalize download by checking for completed torrents"""
         try:
             # Get completed torrents
-            completed_torrents = self.api.request_handler.execute(HttpMethod.GET, '/torrents/completed')
+            completed_torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
             if not completed_torrents:
                 return DownloadCachedStreamResult(success=False, error="No completed torrents found")
             
@@ -1578,7 +1592,7 @@ class RealDebridDownloader(DownloaderBase):
         try:
             # Get list of all torrents with rate limit handling
             with self.rate_limiter:
-                torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
+                torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
                 
             if not torrents:
                 logger.warning("No torrents found to clean up")
@@ -1622,7 +1636,7 @@ class RealDebridDownloader(DownloaderBase):
         deleted = 0
         # Get all downloads in one request to minimize API calls
         try:
-            downloads = self.api.request_handler.execute(HttpMethod.GET, "downloads")
+            downloads = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents_completed'])
             downloads_by_torrent = {}
             for download in downloads:
                 torrent_id = download.get("torrent_id")
@@ -1683,7 +1697,7 @@ class RealDebridDownloader(DownloaderBase):
             logger.debug(f"📡 Fetching info for torrent {torrent_id}")
             info = self.api.request_handler.execute(
                 HttpMethod.GET,
-                f'/torrents/info/{torrent_id}'
+                f"{self.api.ENDPOINTS['torrents_info']}/{torrent_id}"
             )
             
             # Cache the result
@@ -1704,7 +1718,7 @@ class RealDebridDownloader(DownloaderBase):
 
         response = self.api.request_handler.execute(
             HttpMethod.GET,
-            f"torrents/info/{torrent_id}"
+            f"{self.api.ENDPOINTS['torrents_info']}/{torrent_id}"
         )
         
         # Log a cleaner version with just the important info
@@ -1821,7 +1835,7 @@ class RealDebridDownloader(DownloaderBase):
                 aggressive_cleanup = True
             
             # Get list of all torrents
-            torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
+            torrents = self.api.request_handler.execute(HttpMethod.GET, self.api.ENDPOINTS['torrents'])
             to_delete = []  # List of (priority, torrent_id, reason) tuples
             
             # Track torrents by various attributes
@@ -2066,7 +2080,7 @@ class RealDebridDownloader(DownloaderBase):
         for file in files:
             filename = file.get("path", "").lower()
             if any(filename.endswith(ext) for ext in VIDEO_EXTENSIONS):
-                file_id = str(file.get("id"))
+                file_id = str(file.get("id", ""))
                 if file_id:
                     media_files.append(file_id)
                     
