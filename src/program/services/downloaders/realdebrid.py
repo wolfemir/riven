@@ -2269,8 +2269,9 @@ class RealDebridDownloader(DownloaderBase):
 
     def _try_download_stream(self, stream: Stream, item: MediaItem) -> bool:
         """Try to download a stream"""
-        # Add the torrent
-        result = self._add_magnet_or_torrent(magnet=stream.magnet)
+        # Construct magnet link from infohash
+        magnet = f"magnet:?xt=urn:btih:{stream.infohash}"
+        result = self._add_magnet_or_torrent(magnet=magnet)
         if not result:
             return False
         
@@ -2287,7 +2288,7 @@ class RealDebridDownloader(DownloaderBase):
         # Download the torrent
         return self.wait_for_download(result.torrent_id, item.id, item, stream)
 
-    def _add_magnet_or_torrent(self, magnet: str, attempt: int = 1) -> Optional[str]:
+    def _add_magnet_or_torrent(self, magnet: Optional[str] = None, torrent: Optional[bytes] = None) -> Optional[str]:
         """Add a magnet or torrent to Real-Debrid with rate limit handling."""
         max_attempts = 5
         base_backoff = 2  # Base delay in seconds
@@ -2308,7 +2309,7 @@ class RealDebridDownloader(DownloaderBase):
                         
             # Add the magnet with rate limiting
             with self.rate_limiter:
-                logger.debug(f"🧲 Adding magnet (attempt {attempt}/{max_attempts}): {magnet[:64]}...")
+                logger.debug(f"🧲 Adding magnet (attempt {max_attempts}/{max_attempts}): {magnet[:64]}...")
                 response = self.api.request_handler.execute(
                     HttpMethod.POST,
                     "torrents/addMagnet",
@@ -2321,7 +2322,7 @@ class RealDebridDownloader(DownloaderBase):
                     return torrent_id
                     
         except Exception as e:
-            backoff = min(base_backoff * (2 ** (attempt - 1)), 30)  # Cap at 30 seconds
+            backoff = min(base_backoff * (2 ** (max_attempts - 1)), 30)  # Cap at 30 seconds
             
             if "Active Limit Exceeded" in str(e):
                 # Try cleanup and retry quickly
@@ -2330,10 +2331,10 @@ class RealDebridDownloader(DownloaderBase):
                 if cleaned > 0:
                     backoff = 1  # Retry quickly if we cleaned something
                     
-            if attempt < max_attempts:
-                logger.warning(f"⏳ Retrying in {backoff}s... (attempt {attempt}/{max_attempts})")
+            if max_attempts > 1:
+                logger.warning(f"⏳ Retrying in {backoff}s... (attempt {max_attempts}/{max_attempts})")
                 time.sleep(backoff)
-                return self._add_magnet_or_torrent(magnet, attempt + 1)
+                return self._add_magnet_or_torrent(magnet, attempt=max_attempts-1)
             else:
                 logger.error(f"❌ Failed to add torrent after {max_attempts} attempts: {e}")
                 
